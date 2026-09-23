@@ -2,7 +2,9 @@
 """Stream full and incremental GNU tar backups to self-contained tape sets."""
 
 import argparse
+from collections import deque, OrderedDict
 from contextlib import closing, contextmanager
+import ctypes
 from datetime import datetime, timezone
 import errno
 import fcntl
@@ -23,17 +25,21 @@ import time
 import uuid
 
 BLOCK_SIZE = 64 * 1024
-DEFAULT_BUFFER = 64 * 1024**2
-MAX_BUFFER = 256 * 1024**2
-MAGIC = b"TAPE-STREAM-2\n"
+DEFAULT_BUFFER = 1024**3
+MAX_BUFFER = 10 * 1024**3
+FRAME_SIZE = 4 * 1024**2
+POSITION_INTERVAL = 16 * 1024**2
+MAGIC = b"TAPE-STREAM-3\n"
+LEGACY_MAGIC = b"TAPE-STREAM-2\n"
 ZERO_CHAIN = "0" * 64
-PROGRAM_VERSION = "0.3.0"
+PROGRAM_VERSION = "1.0.0"
 # Linux struct mtop: short operation, padding, int count (x86-64 / AArch64).
 MTIOCTOP = 0x40086D01
 MTFSF, MTWEOF = 1, 5
 RECOVERABLE = (errno.ENOSPC, errno.EIO)
-SSH_MAGIC = b"TAPE-SSH-1\n"
-PACKET_HEADER = struct.Struct("!cI")
+SSH_MAGIC = b"TAPE-SSH-2\n"
+# A chunk may exceed the 4 GiB range of the original SSH packet length.
+PACKET_HEADER = struct.Struct("!cQ")
 
 
 class BackupError(Exception):
@@ -111,23 +117,24 @@ def valid_id(value):
     return value
 
 
-def encoded_header(fields):
+def encoded_header(fields, magic=MAGIC):
     payload = json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()
     envelope = json.dumps({"fields": fields, "sha256": hashlib.sha256(payload).hexdigest()},
                           sort_keys=True, separators=(",", ":")).encode()
-    record = MAGIC + envelope + b"\n"
+    record = magic + envelope + b"\n"
     if len(record) > BLOCK_SIZE:
         raise BackupError("Tape metadata header exceeds 64 KiB")
     return record.ljust(BLOCK_SIZE, b"\0")
 
 
 def decoded_header(record):
-    if len(record) != BLOCK_SIZE or not record.startswith(MAGIC):
+    magic = LEGACY_MAGIC if record.startswith(LEGACY_MAGIC) else MAGIC
+    if len(record) != BLOCK_SIZE or not record.startswith(magic):
         raise BackupError("Wrong tape format or corrupt record header")
     try:
-        envelope = json.loads(record[len(MAGIC):].rstrip(b"\0\n"))
+        envelope = json.loads(record[len(magic):].rstrip(b"\0\n"))
         fields = envelope["fields"]
-        if not isinstance(fields, dict) or encoded_header(fields) != record:
+        if not isinstance(fields, dict) or encoded_header(fields, magic) != record:
             raise ValueError("metadata checksum mismatch")
         return fields
     except (TypeError, ValueError, KeyError) as exc:
@@ -139,14 +146,18 @@ class EndVolume(Exception):
 
 
 class Progress:
-    def __init__(self, label, *, transfer=True):
+    def __init__(self, label, *, transfer=True, buffer_size=None):
         self.label = label
         self.transfer = transfer
+        self.buffer_size = buffer_size
         self.read_bytes = self.written_bytes = self.transferred = 0
+        self.queued_bytes = self.retry_bytes = self.durable_bytes = 0
+        self.reader_state = None
         self.phase = "waiting for media"
         self.stop = threading.Event()
         self.started = self.last_time = time.monotonic()
         self.last_bytes = 0
+        self.last_read_bytes = 0
         self.total_bytes = None
         self.eta_base = 0
         self.eta_started = self.started
@@ -161,9 +172,11 @@ class Progress:
         if not self.transfer:
             log(f"{self.label}: {self.phase}; {now - self.started:.0f}s elapsed")
             return
-        rate = (self.transferred - self.last_bytes) / max(now - self.last_time, 0.001) / 1024**2
-        average = self.transferred / max(now - self.started, 0.001) / 1024**2
-        done = self.written_bytes - self.eta_base
+        read_bytes, written_bytes, transferred = self.read_bytes, self.written_bytes, self.transferred
+        rate = (transferred - self.last_bytes) / max(now - self.last_time, 0.001) / 1024**2
+        read_rate = (read_bytes - self.last_read_bytes) / max(now - self.last_time, 0.001) / 1024**2
+        average = transferred / max(now - self.started, 0.001) / 1024**2
+        done = written_bytes - self.eta_base
         if self.phase == "complete":
             eta = "00:00:00"
         elif not self.total_bytes or not done:
@@ -173,11 +186,20 @@ class Progress:
         else:
             seconds = int((self.total_bytes - done) * (now - self.eta_started) / done)
             eta = f"~{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
-        log(f"{self.label}: {self.phase}; {self.read_bytes / 1024**2:.1f} MiB read, "
-            f"{self.written_bytes / 1024**2:.1f} MiB delivered; "
+        buffer = f"buffer {self.buffer_size / 1024**2:g} MiB; " if self.buffer_size is not None else ""
+        if self.buffer_size is not None:
+            buffer += (f"queued {self.queued_bytes / 1024**2:.1f} MiB, "
+                       f"recovery {self.retry_bytes / 1024**2:.1f} MiB, "
+                       f"committed {self.durable_bytes / 1024**2:.1f} MiB; ")
+        reader = (f"reader {self.reader_state}, {read_rate:.1f} MiB/s source; "
+                  if self.reader_state is not None else "")
+        log(f"{self.label}: {self.phase}; {read_bytes / 1024**2:.1f} MiB read, "
+            f"{written_bytes / 1024**2:.1f} MiB delivered; "
+            f"{buffer}{reader}"
             f"{rate:.1f} MiB/s I/O, {average:.1f} MiB/s average; "
             f"ETA {eta} (current archive); {now - self.started:.0f}s elapsed")
-        self.last_time, self.last_bytes = now, self.transferred
+        self.last_time, self.last_bytes = now, transferred
+        self.last_read_bytes = read_bytes
 
     def __enter__(self):
         def heartbeat():
@@ -193,13 +215,66 @@ class Progress:
         self.report()
 
 
+class SgIoHeader(ctypes.Structure):
+    """Linux sg_io_hdr_t; native alignment also supports 32-bit hosts."""
+
+    _fields_ = [("interface_id", ctypes.c_int), ("dxfer_direction", ctypes.c_int),
+                ("cmd_len", ctypes.c_ubyte), ("mx_sb_len", ctypes.c_ubyte),
+                ("iovec_count", ctypes.c_ushort), ("dxfer_len", ctypes.c_uint),
+                ("dxferp", ctypes.c_void_p), ("cmdp", ctypes.c_void_p),
+                ("sbp", ctypes.c_void_p), ("timeout", ctypes.c_uint),
+                ("flags", ctypes.c_uint), ("pack_id", ctypes.c_int),
+                ("usr_ptr", ctypes.c_void_p), ("status", ctypes.c_ubyte),
+                ("masked_status", ctypes.c_ubyte), ("msg_status", ctypes.c_ubyte),
+                ("sb_len_wr", ctypes.c_ubyte), ("host_status", ctypes.c_ushort),
+                ("driver_status", ctypes.c_ushort), ("resid", ctypes.c_int),
+                ("duration", ctypes.c_uint), ("info", ctypes.c_uint)]
+
+
+def tape_position(fd):
+    """READ POSITION short form: (next host object, next unwritten object).
+
+    Unlike MTIOCPOS, this exposes the on-medium position. No filemarks or
+    movement commands are sent. None means telemetry cannot be trusted.
+    """
+    command = ctypes.create_string_buffer(bytes([0x34]) + bytes(9), 10)
+    data, sense = ctypes.create_string_buffer(20), ctypes.create_string_buffer(64)
+    header = SgIoHeader(interface_id=ord('S'), dxfer_direction=-3,
+                        cmd_len=10, mx_sb_len=64, dxfer_len=20,
+                        dxferp=ctypes.addressof(data), cmdp=ctypes.addressof(command),
+                        sbp=ctypes.addressof(sense), timeout=60000)
+    raw = bytearray(bytes(header))
+    try:
+        fcntl.ioctl(fd, 0x2285, raw, True)  # SG_IO
+    except OSError as exc:
+        if exc.errno in (errno.ENOTTY, errno.EINVAL, errno.ENOSYS, errno.EPERM, errno.EACCES):
+            return None
+        raise
+    header = SgIoHeader.from_buffer_copy(raw)
+    if header.status or header.host_status or header.driver_status:
+        response = sense.raw[0] & 0x7f
+        key = (sense.raw[2] if response in (0x70, 0x71) else sense.raw[1]) & 0xf
+        if (header.status == 2 and not header.host_status and
+                response in (0x70, 0x72) and key == 5):  # Unsupported command/form.
+            return None
+        raise OSError(errno.EIO, "READ POSITION failed; buffered tape writes may have failed")
+    if header.resid or data.raw[0] & 0x06:  # Position unknown or position overflow.
+        return None
+    first, last = struct.unpack_from('>II', data.raw, 4)
+    if last > first:
+        return None
+    return first, last
+
+
 class Volume:
-    """Record I/O; physical tape uses synchronous filemarks as commit points."""
+    """Record I/O with non-flushing durability queries and explicit commits."""
 
     def __init__(self, stream, physical=False):
         self.stream = stream
         self.physical = physical
         self.progress = None
+        self.objects = self.durable_objects = 0
+        self.position_disabled = False
 
     def write(self, record):
         count = self.stream.write(record)
@@ -207,13 +282,29 @@ class Volume:
             self.progress.transferred += count
         if count != len(record):
             raise OSError(errno.ENOSPC, "Short tape record write")
+        self.objects += 1
 
     def commit(self):
         if self.physical:
             # MTWEOF, unlike MTWEOFI, waits for buffered data to reach the tape.
             fcntl.ioctl(self.stream.fileno(), MTIOCTOP, struct.pack("@hi", MTWEOF, 1))
+            self.objects += 1
         else:
             os.fsync(self.stream.fileno())
+        self.durable_objects = self.objects
+
+    def durable_position(self):
+        if not self.physical or self.position_disabled:
+            return None
+        position = tape_position(self.stream.fileno())
+        if (position is None or position[0] != self.objects or
+                not self.durable_objects <= position[1] <= self.objects):
+            self.position_disabled = True
+            log("Drive position unavailable or inconsistent; using synchronous commits "
+                "when the recovery buffer fills")
+            return None
+        self.durable_objects = position[1]
+        return position[1]
 
     def read(self, *, boundary=False):
         try:
@@ -230,15 +321,18 @@ class Volume:
             raise EndVolume
         return record
 
-    def skip_payload(self, length):
+    def skip_payload(self, length, *, filemarks=True):
         """Skip file data when loading a snapshot; this does not verify data."""
-        if self.physical:
+        if self.physical and filemarks:
             try:
                 fcntl.ioctl(self.stream.fileno(), MTIOCTOP, struct.pack("@hi", MTFSF, 1))
             except OSError as exc:
                 if exc.errno in RECOVERABLE:
                     raise EndVolume from exc
                 raise
+        elif self.physical:
+            for _ in range((length + BLOCK_SIZE - 1) // BLOCK_SIZE):
+                self.read()
         else:
             size = ((length + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
             if self.stream.tell() + size > os.fstat(self.stream.fileno()).st_size:
@@ -299,14 +393,15 @@ class TapeMedia:
     def mt(self, *args):
         if args == ("rewind",):
             # MTWEOF itself honors the driver's NOWAIT_EOF setting. Disabling
-            # both immediate modes is essential before discarding RAM buffers.
+            # immediate modes and kernel async writes keeps our object count
+            # aligned with completed SCSI commands. Drive buffering stays on.
             options = Path("/sys/class/scsi_tape") / Path(self.device).name / "options"
             try:
-                synchronous = int(options.read_text().strip(), 0) & 0xA000 == 0
+                synchronous = int(options.read_text().strip(), 0) & 0xA002 == 0
             except (OSError, ValueError):
                 synchronous = False
             if not synchronous:
-                run_command(["mt", "-f", self.device, "stclearoptions", "0xa000"])
+                run_command(["mt", "-f", self.device, "stclearoptions", "0xa002"])
         run_command(["mt", "-f", self.device, *args])
 
     def load(self, backup_id, number, writing):
@@ -317,13 +412,14 @@ class TapeMedia:
         else:
             warning = " (CONTENTS WILL BE OVERWRITTEN)" if writing else ""
             try:
-                with open("/dev/tty", "r+") as tty:
-                    tty.write(f"Load {backup_id} volume {number} into {self.device} for {action}{warning}.\n"
-                              "Press Enter when ready, or type q to stop: ")
-                    tty.flush()
-                    response = tty.readline()
+                # Buffered r+ requires seeking, which terminals do not support.
+                with open("/dev/tty", "r") as tty_in, open("/dev/tty", "w") as tty_out:
+                    tty_out.write(f"Load {backup_id} volume {number} into {self.device} for {action}{warning}.\n"
+                                  "Press Enter when ready, or type q to stop: ")
+                    tty_out.flush()
+                    response = tty_in.readline()
             except OSError as exc:
-                raise BackupError("No terminal for tape changes; use --media-command") from exc
+                raise BackupError(f"No terminal for tape changes; use --media-command ({exc})") from exc
             if not response or response.strip().lower() == "q":
                 raise BackupError("Media change cancelled; the streaming operation is incomplete")
         self.mt("rewind")
@@ -343,13 +439,20 @@ class TapeMedia:
 
 
 class StreamWriter:
-    def __init__(self, media, job, volume_size, progress):
+    """Continuously write small frames, retaining the unconfirmed tail in RAM."""
+
+    def __init__(self, media, job, volume_size, progress, buffer_size=DEFAULT_BUFFER):
         self.media, self.job = media, job
         self.volume_size, self.progress = volume_size, progress
+        self.replay_limit = max(2 * BLOCK_SIZE, buffer_size)
+        if volume_size:
+            self.replay_limit = min(self.replay_limit, volume_size - BLOCK_SIZE)
         self.volume = None
-        self.number = self.sequence = self.used = self.frames = 0
+        self.number = self.sequence = self.used = 0
         self.chain = ZERO_CHAIN
-        self.no_progress = 0
+        self.pending = deque()
+        self.pending_bytes = self.since_position = 0
+        self.no_progress = self.committed_frames = 0
 
     def close(self, *, ignore_errors=False):
         if self.volume is not None:
@@ -365,59 +468,127 @@ class StreamWriter:
         if self.number:
             self.media.release()
         self.number += 1
+        self.committed_frames = 0
         self.progress.phase = f"load volume {self.number}"
         self.media.load(self.job["id"], self.number, True)
         self.volume = self.media.open(True)
         self.volume.progress = self.progress
-        self.volume.write(encoded_header({"type": "volume", "format": 2, "backup": self.job,
-                                          "volume": self.number, "sequence": self.sequence,
-                                          "previous": self.chain}))
+        first = self.pending[0] if self.pending else None
+        self.volume.write(encoded_header({"type": "volume", "format": 3, "backup": self.job,
+                                          "volume": self.number,
+                                          "sequence": first["sequence"] if first else self.sequence,
+                                          "previous": first["previous"] if first else self.chain,
+                                          "replay_bytes": self.replay_limit}))
         self.volume.commit()
-        self.used, self.frames = BLOCK_SIZE, 0
+        self.used, self.committed_frames, self.since_position = BLOCK_SIZE, 0, 0
+        # Probe before accepting archive bytes. Unsupported drives use the same
+        # bounded recovery algorithm, with commits only on buffer pressure.
+        self.volume.durable_position()
         self.progress.phase = f"streaming to volume {self.number}"
-        log(f"Writing {self.job['id']} volume {self.number}, chunk {self.sequence}")
+        log(f"Writing {self.job['id']} volume {self.number}, chunk "
+            f"{first['sequence'] if first else self.sequence}")
+
+    def retire(self, position):
+        while self.pending and self.pending[0]["end"] is not None and self.pending[0]["end"] <= position:
+            frame = self.pending.popleft()
+            self.pending_bytes -= frame["size"]
+            self.committed_frames += 1
+            if frame["kind"] == "data":
+                self.progress.durable_bytes += len(frame["data"])
+        self.progress.retry_bytes = self.pending_bytes
+
+    def poll_position(self):
+        position = self.volume.durable_position()
+        self.since_position = 0
+        if position is not None:
+            self.retire(position)
+
+    def write_frame(self, frame):
+        self.progress.phase = f"writing volume {self.number}, chunk {frame['sequence']}"
+        self.volume.write(frame["record"])
+        view = memoryview(frame["data"])
+        for offset in range(0, len(view), BLOCK_SIZE):
+            block = view[offset:offset + BLOCK_SIZE]
+            self.volume.write(block if len(block) == BLOCK_SIZE else
+                              bytes(block).ljust(BLOCK_SIZE, b"\0"))
+        frame["end"] = self.volume.objects
+        self.used += frame["size"]
+        self.since_position += frame["size"]
+
+    def recover(self, error):
+        while True:
+            if error.errno not in RECOVERABLE:
+                raise error
+            self.no_progress = 1 if self.committed_frames else self.no_progress + 1
+            if self.no_progress >= 3:
+                raise BackupError("Three volumes could not commit data; check drive/media and buffer size") from error
+            log(f"Volume {self.number}: {error}. Retain this volume; replaying "
+                f"{len(self.pending)} uncommitted chunk(s) from RAM on the next tape.")
+            # Old physical positions must never release a frame on a new tape.
+            for frame in self.pending:
+                frame["end"] = None
+            # A failed volume header is not a skippable data tail: readers need
+            # every numbered volume's identity and replay boundary. Abort if
+            # initialization fails rather than publish an unreadable tape set.
+            self.next_volume()
+            try:
+                for frame in self.pending:
+                    self.write_frame(frame)
+                return
+            except OSError as exc:
+                error = exc
+
+    def flush(self, reason):
+        while True:
+            self.progress.phase = f"flushing volume {self.number} ({reason})"
+            try:
+                self.volume.commit()
+            except OSError as exc:
+                self.recover(exc)
+            else:
+                self.retire(self.volume.objects)
+                return
 
     def send(self, kind, data):
-        if not data or len(data) > MAX_BUFFER:
-            raise BackupError("Invalid streaming chunk size")
+        if not data or len(data) > FRAME_SIZE:
+            raise BackupError("Invalid continuous-stream frame size")
+        size = BLOCK_SIZE + ((len(data) + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+        if size > self.replay_limit:
+            raise BackupError("Frame cannot fit in the recovery buffer")
+        if self.volume is None:
+            self.next_volume()
+        if self.volume_size and self.used + size > self.volume_size:
+            self.flush("volume boundary")
+            self.next_volume()
+        if self.pending_bytes + size > self.replay_limit:
+            try:
+                self.poll_position()
+            except OSError as exc:
+                self.recover(exc)
+            if self.pending_bytes + size > self.replay_limit:
+                self.flush("recovery buffer full")
         fields = {"type": "chunk", "sequence": self.sequence, "kind": kind,
                   "length": len(data), "sha256": hashlib.sha256(data).hexdigest(),
                   "previous": self.chain}
         record = encoded_header(fields)
-        required = BLOCK_SIZE + ((len(data) + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
-        if self.volume_size and required + BLOCK_SIZE > self.volume_size:
-            raise BackupError("Chunk cannot fit on the configured volume")
-        while True:
-            if self.volume is None or (self.volume_size and self.used + required > self.volume_size):
-                self.next_volume()
-            try:
-                self.volume.write(record)
-                view = memoryview(data)
-                for offset in range(0, len(data), BLOCK_SIZE):
-                    block = view[offset:offset + BLOCK_SIZE]
-                    self.volume.write(block if len(block) == BLOCK_SIZE else
-                                      bytes(block).ljust(BLOCK_SIZE, b"\0"))
-                self.progress.phase = f"flushing volume {self.number}, chunk {self.sequence}"
-                self.volume.commit()
-            except OSError as exc:
-                if exc.errno not in RECOVERABLE:
-                    raise
-                self.no_progress = self.no_progress + 1 if not self.frames else 1
-                if self.no_progress >= 3:
-                    raise BackupError("Three volumes could not commit a chunk; check drive/media and buffer size") from exc
-                log(f"Volume {self.number}: {exc}. Retain this volume; "
-                    f"replaying chunk {self.sequence} from RAM on the next tape.")
-                self.next_volume()
-                continue
-            self.sequence += 1
-            self.chain = hashlib.sha256(record).hexdigest()
-            self.used += required
-            self.frames += 1
-            self.no_progress = 0
-            self.progress.phase = f"streaming to volume {self.number}"
-            if kind == "data":
-                self.progress.written_bytes += len(data)
-            return
+        frame = {**fields, "data": data, "record": record, "size": size, "end": None}
+        self.pending.append(frame)
+        self.pending_bytes += size
+        self.progress.retry_bytes = self.pending_bytes
+        self.sequence += 1
+        self.chain = hashlib.sha256(record).hexdigest()
+        try:
+            self.write_frame(frame)
+            if self.since_position >= POSITION_INTERVAL:
+                self.poll_position()
+        except OSError as exc:
+            self.recover(exc)
+        if kind == "data":
+            self.progress.written_bytes += len(data)
+        self.progress.phase = f"streaming to volume {self.number}"
+
+    def finish(self):
+        self.flush("backup completion")
 
 
 class StreamReader:
@@ -427,6 +598,9 @@ class StreamReader:
         self.number = self.sequence = 0
         self.chain = ZERO_CHAIN
         self.last_header = self.summary = None
+        self.format = None
+        self.replay_limit = self.history_bytes = 0
+        self.history = OrderedDict()
 
     def close(self):
         if self.volume is not None:
@@ -445,9 +619,17 @@ class StreamReader:
             head = decoded_header(self.volume.read(boundary=True))
             job = head["backup"]
             valid_id(job["id"])
-            if (head["type"] != "volume" or head["format"] != 2 or head["volume"] != self.number or
+            if (head["type"] != "volume" or head["format"] not in (2, 3) or head["volume"] != self.number or
                     (self.backup_id is not None and job["id"] != self.backup_id)):
                 raise ValueError("wrong backup or volume number")
+            if self.format is not None and head["format"] != self.format:
+                raise ValueError("tape format changed between volumes")
+            if head["format"] == 3:
+                limit = head["replay_bytes"]
+                if (type(limit) is not int or not 2 * BLOCK_SIZE <= limit <= MAX_BUFFER or
+                        (self.replay_limit and limit != self.replay_limit)):
+                    raise ValueError("invalid recovery window")
+                self.replay_limit = limit
             if job["level"] not in ("full", "incremental") or not isinstance(job["source"], str):
                 raise ValueError("invalid backup metadata")
             if job["level"] == "full" and job["parent"] is not None:
@@ -456,13 +638,24 @@ class StreamReader:
                 valid_id(job["parent"])
             if self.job is not None and job != self.job:
                 raise ValueError("volume belongs to a different backup")
-            replay = self.last_header is not None and head["sequence"] == self.sequence - 1
-            previous = self.last_header["previous"] if replay else self.chain
-            if head["sequence"] != self.sequence - int(replay) or head["previous"] != previous:
+            if type(head["sequence"]) is not int:
+                raise ValueError("invalid sequence")
+            if head["format"] == 2:
+                replay = self.last_header is not None and head["sequence"] == self.sequence - 1
+                previous = self.last_header["previous"] if replay else self.chain
+                if head["sequence"] != self.sequence - int(replay) or head["previous"] != previous:
+                    raise ValueError("missing or reordered chunks between tapes")
+            elif head["sequence"] == self.sequence:
+                if head["previous"] != self.chain:
+                    raise ValueError("broken chain between tapes")
+            elif (head["sequence"] not in self.history or
+                    self.history[head["sequence"]][0] != head["previous"]):
                 raise ValueError("missing or reordered chunks between tapes")
         except (KeyError, TypeError, ValueError, EndVolume) as exc:
             raise BackupError(f"Wrong or incomplete volume {self.number}: {exc}") from exc
         self.job, self.backup_id = job, job["id"]
+        self.format = head["format"]
+        self.volume_sequence, self.volume_chain = head["sequence"], head["previous"]
 
     def frames(self, *, skip_data=False):
         if self.volume is None:
@@ -477,16 +670,27 @@ class StreamReader:
                 head = decoded_header(record)
                 try:
                     if (head["type"] != "chunk" or head["kind"] not in ("data", "snapshot", "end") or
-                            type(head["length"]) is not int or not 0 < head["length"] <= MAX_BUFFER or
+                            type(head["length"]) is not int or
+                            not 0 < head["length"] <= (MAX_BUFFER if self.format == 2 else FRAME_SIZE) or
+                            type(head["sequence"]) is not int or
                             not re.fullmatch(r"[0-9a-f]{64}", head["sha256"])):
                         raise ValueError("invalid chunk fields")
-                    duplicate = head["sequence"] == self.sequence - 1 and head == self.last_header
-                    if not duplicate and (head["sequence"] != self.sequence or head["previous"] != self.chain):
+                    digest = hashlib.sha256(record).hexdigest()
+                    duplicate = head["sequence"] < self.sequence
+                    if head["sequence"] != self.volume_sequence or head["previous"] != self.volume_chain:
+                        raise ValueError("missing, reordered or corrupt chunk")
+                    if duplicate:
+                        known = (head == self.last_header if self.format == 2 else
+                                 head["sequence"] in self.history and
+                                 self.history[head["sequence"]][1] == digest)
+                        if not known:
+                            raise ValueError("replayed chunk differs from the original")
+                    elif head["sequence"] != self.sequence or head["previous"] != self.chain:
                         raise ValueError("missing, reordered or corrupt chunk")
                 except (KeyError, TypeError, ValueError) as exc:
                     raise BackupError(f"Invalid chunk header: {exc}") from exc
                 if skip_data and head["kind"] == "data":
-                    self.volume.skip_payload(head["length"])
+                    self.volume.skip_payload(head["length"], filemarks=self.format == 2)
                     payload = None
                 else:
                     payload = bytearray()
@@ -507,11 +711,21 @@ class StreamReader:
                 self.next_volume()
                 continue
             empty_volumes = 0
+            self.volume_sequence += 1
+            self.volume_chain = digest
             if duplicate:
-                continue  # A complete chunk can survive a failed filemark flush.
+                continue  # Several complete frames may survive a delayed error.
             self.last_header = head
             self.sequence += 1
-            self.chain = hashlib.sha256(record).hexdigest()
+            self.chain = digest
+            if self.format == 3:
+                size = BLOCK_SIZE + ((head["length"] + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+                if size > self.replay_limit:
+                    raise BackupError("Chunk exceeds the declared recovery window")
+                self.history[head["sequence"]] = (head["previous"], digest, size)
+                self.history_bytes += size
+                while self.history_bytes > self.replay_limit:
+                    self.history_bytes -= self.history.popitem(last=False)[1][2]
             if head["kind"] == "data":
                 if phase != "data":
                     raise BackupError("File data appears after the incremental snapshot")
@@ -563,7 +777,7 @@ def read_chunks(stream, size, progress=None):
         yield chunk
 
 
-def stop_process(process):
+def stop_process(process, *, close_streams=True):
     if process is None:
         return
     if process.poll() is None:
@@ -573,12 +787,99 @@ def stop_process(process):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
-    for stream in (process.stdin, process.stdout):
-        if stream is not None:
+    if close_streams:
+        for stream in (process.stdin, process.stdout):
+            if stream is not None:
+                try:
+                    stream.close()
+                except BrokenPipeError:
+                    pass
+
+
+class ReadAhead:
+    """A bounded queue; reserve a slot before reading, release after delivery."""
+
+    def __init__(self, frames, cancel, progress, slots=2):
+        self.frames, self.cancel, self.progress = frames, cancel, progress
+        self.condition = threading.Condition()
+        self.pending = deque()
+        self.slots = slots
+        self.stopped = self.done = False
+        self.error = None
+        self.thread = threading.Thread(target=self.read, name="tape-backup-reader", daemon=True)
+        self.consumer = self.consume()
+
+    def read(self):
+        try:
+            with closing(self.frames):
+                while True:
+                    with self.condition:
+                        if not self.slots:
+                            self.progress.reader_state = "waiting (buffers full)"
+                        self.condition.wait_for(lambda: self.slots or self.stopped)
+                        if self.stopped:
+                            return
+                        self.slots -= 1  # Reserve space before filling a chunk.
+                        self.progress.reader_state = "reading"
+                    try:
+                        frame = next(self.frames)
+                    except StopIteration:
+                        return
+                    with self.condition:
+                        if self.stopped:
+                            return
+                        self.pending.append(frame)
+                        self.progress.queued_bytes += len(frame[1])
+                        del frame
+                        self.condition.notify_all()
+        except BaseException as exc:
+            self.error = exc
+        finally:
+            with self.condition:
+                self.done = True
+                self.progress.reader_state = ("stopped" if self.stopped else
+                                              "failed" if self.error else "finished")
+                self.condition.notify_all()
+
+    def consume(self):
+        while True:
+            with self.condition:
+                if not self.pending and not self.done:
+                    self.progress.phase = "waiting for source"
+                self.condition.wait_for(lambda: self.pending or self.done)
+                if not self.pending:
+                    if self.error is not None:
+                        raise self.error
+                    return
+                frame = self.pending.popleft()
+                self.progress.queued_bytes -= len(frame[1])
             try:
-                stream.close()
-            except BrokenPipeError:
-                pass
+                yield frame
+            finally:
+                del frame
+                with self.condition:
+                    self.slots += 1
+                    self.condition.notify_all()
+
+    def __enter__(self):
+        self.progress.reader_state = "starting"
+        self.thread.start()
+        return self.consumer
+
+    def __exit__(self, *args):
+        with self.condition:
+            self.stopped = True
+            self.condition.notify_all()
+        try:
+            if self.thread.is_alive():
+                # Terminate the source to unblock reads; its reader owns the
+                # stream until it exits, so do not close it from this thread.
+                self.cancel()
+        finally:
+            self.thread.join()
+            self.consumer.close()
+            self.pending.clear()
+            self.progress.queued_bytes = 0
 
 
 def scan(media, backup_id=None, snapshot_fd=None, *, verify=True):
@@ -628,15 +929,20 @@ def estimate_source(source, parent_created=None):
     return ((total + 10239) // 10240) * 10240
 
 
-def archive_frames(source, snapshot_fd, buffer_size, quiet):
-    """Produce tar and its updated RAM snapshot, locally or on the SSH source."""
+def start_archive(source, snapshot_fd, quiet):
     args = ["tar", "--create", "--format=posix", "--acls", "--xattrs", "--sparse",
             "--numeric-owner", f"--listed-incremental=/proc/self/fd/{snapshot_fd}",
             "--file=-", f"--directory={source}", *([] if quiet else ["--verbose"]), "--", "."]
-    process = subprocess.Popen(args, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                               env=external_env(), pass_fds=(snapshot_fd,))
+    return subprocess.Popen(args, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                            env=external_env(), pass_fds=(snapshot_fd,))
+
+
+def archive_frames(source, snapshot_fd, buffer_size, quiet, process=None, progress=None):
+    """Produce tar and its updated RAM snapshot, locally or on the SSH source."""
+    if process is None:
+        process = start_archive(source, snapshot_fd, quiet)
     try:
-        for chunk in read_chunks(process.stdout, buffer_size):
+        for chunk in read_chunks(process.stdout, buffer_size, progress):
             yield "data", chunk
         if process.wait():
             raise BackupError("GNU tar failed; this tape set has no completion marker and must be restarted")
@@ -648,7 +954,7 @@ def archive_frames(source, snapshot_fd, buffer_size, quiet):
         stop_process(process)
 
 
-def read_exact(stream, size):
+def read_exact(stream, size, progress=None):
     result = bytearray()
     while len(result) < size:
         block = stream.read(min(1024**2, size - len(result)))
@@ -656,6 +962,8 @@ def read_exact(stream, size):
             raise BackupError("SSH source disconnected or returned an incomplete stream; "
                               "check the SSH errors above and the remote binary version")
         result.extend(block)
+        if progress:
+            progress.read_bytes += len(block)
     return result
 
 
@@ -665,11 +973,11 @@ def send_packet(stream, kind, payload=b""):
     stream.flush()
 
 
-def receive_packet(stream, limit):
+def receive_packet(stream, limit, progress=None):
     kind, size = PACKET_HEADER.unpack(read_exact(stream, PACKET_HEADER.size))
     if size > limit:
         raise BackupError("SSH source packet exceeds the negotiated buffer size")
-    return kind, read_exact(stream, size)
+    return kind, read_exact(stream, size, progress if kind == b"d" else None)
 
 
 def receive_json(stream):
@@ -739,12 +1047,12 @@ class RemoteSource:
             raise BackupError("Invalid SSH source path or size estimate")
         return metadata
 
-    def frames(self):
+    def frames(self, progress=None):
         send_packet(self.process.stdin, b"g")  # Start only after the first tape is loaded.
         self.process.stdin.close()
         phase = b"d"
         while True:
-            kind, payload = receive_packet(self.process.stdout, self.buffer_size)
+            kind, payload = receive_packet(self.process.stdout, self.buffer_size, progress)
             if kind == b"e" and not payload:
                 break
             if kind not in (b"d", b"s") or not payload or (phase == b"s" and kind == b"d"):
@@ -811,11 +1119,13 @@ def backup(source, media, *, level="full", base=None, volume_size=None,
     if level not in ("full", "incremental") or (level == "incremental") != bool(base):
         raise BackupError("Incremental backup requires --base ID; full backup must not use --base")
     if not BLOCK_SIZE <= buffer_size <= MAX_BUFFER:
-        raise BackupError("Buffer size must be between 64KiB and 256MiB")
+        raise BackupError("Buffer size must be between 64KiB and 10GiB")
     if volume_size is not None:
         if volume_size < 4 * BLOCK_SIZE:
             raise BackupError("Volume size must be at least 256KiB")
-        buffer_size = min(buffer_size, (volume_size // BLOCK_SIZE - 2) * BLOCK_SIZE)
+    frame_size = min(FRAME_SIZE, max(BLOCK_SIZE, (buffer_size // BLOCK_SIZE - 1) * BLOCK_SIZE))
+    if volume_size:
+        frame_size = min(frame_size, (volume_size // BLOCK_SIZE - 2) * BLOCK_SIZE)
     if not ssh:
         require_tar()
     with media.lock(), ram_snapshot() as snapshot_fd:
@@ -829,7 +1139,7 @@ def backup(source, media, *, level="full", base=None, volume_size=None,
                 raise BackupError("Incremental SSH source differs from the parent backup")
             parent_created = parent["created"]
             media.release()
-        remote = RemoteSource(ssh, source, snapshot_fd, parent_created, buffer_size, quiet) if ssh else None
+        remote = RemoteSource(ssh, source, snapshot_fd, parent_created, frame_size, quiet) if ssh else None
         try:
             if remote:
                 metadata = remote.prepare()
@@ -840,52 +1150,63 @@ def backup(source, media, *, level="full", base=None, volume_size=None,
             if parent and parent["source"] != str(source):
                 raise BackupError("Incremental source differs from the parent backup")
             return write_backup(source, media, level, base, volume_size, buffer_size, quiet,
-                                snapshot_fd, estimated_bytes, remote)
+                                snapshot_fd, estimated_bytes, remote, frame_size)
         finally:
             if remote:
                 remote.close()
 
 
 def write_backup(source, media, level, base, volume_size, buffer_size, quiet,
-                 snapshot_fd, estimated_bytes, remote):
+                 snapshot_fd, estimated_bytes, remote, frame_size):
     job = {"id": uuid.uuid4().hex, "level": level, "parent": base, "source": str(source),
            "created": datetime.now(timezone.utc).isoformat(), "estimated_bytes": estimated_bytes}
     if remote:
         job["ssh"] = remote.config.metadata
     label = f"{remote.config.host}:{source}" if remote else source
     log(f"Streaming {level} backup {job['id']} from {label}; "
-        f"buffer {buffer_size / 1024**2:g} MiB; no disk archive or state directory")
-    with Progress(job["id"]) as progress:
+        f"buffer {buffer_size / 1024**2:g} MiB; continuous writes, "
+        f"{frame_size / 1024**2:g} MiB frames, background reader; "
+        "no disk archive or state directory")
+    with Progress(job["id"], buffer_size=buffer_size) as progress:
         progress.estimate(estimated_bytes)
-        writer = StreamWriter(media, job, volume_size, progress)
+        writer = StreamWriter(media, job, volume_size, progress, buffer_size)
+        process = None
         try:
             writer.next_volume()  # Load the tape before starting the source scan.
             data_hash = hashlib.sha256()
             snapshot_hash, snapshot_bytes = hashlib.sha256(), 0
-            frames = remote.frames() if remote else archive_frames(source, snapshot_fd, buffer_size, quiet)
-            with closing(frames):
+            process = remote.process if remote else start_archive(source, snapshot_fd, quiet)
+            source_frames = remote.frames(progress) if remote else archive_frames(
+                source, snapshot_fd, frame_size, quiet, process, progress)
+            with ReadAhead(source_frames, lambda: stop_process(process, close_streams=False), progress,
+                           slots=max(2, buffer_size // frame_size + 1)) as frames:
                 for kind, chunk in frames:
+                    progress.phase = f"hashing chunk {writer.sequence}"
                     if kind == "data":
-                        progress.read_bytes += len(chunk)
                         data_hash.update(chunk)
                     else:
                         progress.phase = "writing incremental snapshot to tape"
                         snapshot_hash.update(chunk)
                         snapshot_bytes += len(chunk)
                     writer.send(kind, chunk)
+                    del chunk  # Release it before the reader reuses its slot.
             if not snapshot_bytes or not progress.read_bytes:
                 raise BackupError("Source did not produce an archive and incremental snapshot")
             end = {"data_bytes": progress.read_bytes, "data_sha256": data_hash.hexdigest(),
                    "snapshot_bytes": snapshot_bytes, "snapshot_sha256": snapshot_hash.hexdigest(),
                    "chunks": writer.sequence}
             writer.send("end", json.dumps(end, sort_keys=True).encode())
+            writer.finish()
             writer.close()
             media.release()
             progress.phase = "complete"
             log(f"Completed {job['id']}: {progress.read_bytes} archive bytes, {writer.number} volume(s)")
             return job["id"]
         finally:
-            writer.close(ignore_errors=True)
+            try:
+                stop_process(process)
+            finally:
+                writer.close(ignore_errors=True)
 
 
 def restore(backup_ids, destination, media, *, quiet=False):
@@ -983,7 +1304,8 @@ def make_parser():
     create.add_argument("--remote-program", help="Remote executable path (default: tape-backup in PATH)")
     create.add_argument("--level", choices=("full", "incremental"), default="full")
     create.add_argument("--base", help="Previous backup ID, required for incremental backups; load its tapes first")
-    create.add_argument("--buffer-size", type=parse_size, default=DEFAULT_BUFFER, help="RAM retry buffer (default: 64MiB)")
+    create.add_argument("--buffer-size", type=parse_size, default=DEFAULT_BUFFER,
+                        help="RAM read-ahead and recovery budgets, each 64KiB to 10GiB (default: 1GiB)")
     create.add_argument("--volume-size", type=parse_size, help="Optional cap on record bytes per tape; default: until full")
     create.add_argument("--quiet", action="store_true", help="Suppress file names; keep progress and transfer rates")
     media_options(create)

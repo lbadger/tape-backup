@@ -1,5 +1,6 @@
 """Run with TAPE_BACKUP_BINARY=/absolute/path/to/dist/tape-backup."""
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+
+import tape_backup as tb
 
 
 @unittest.skipUnless(os.environ.get("TAPE_BACKUP_BINARY"),
@@ -35,9 +38,9 @@ class BinaryTests(unittest.TestCase):
         self.backup_args = ["backup", "--source", self.source, "--media-dir", self.media,
                             "--volume-size", "512KiB", "--buffer-size", "64KiB"]
 
-    def run_binary(self, *args, expected=0):
+    def run_binary(self, *args, expected=0, timeout=60):
         result = subprocess.run([str(self.binary), *map(str, args)], cwd=self.root,
-                                env=self.env, capture_output=True, text=True, timeout=60)
+                                env=self.env, capture_output=True, text=True, timeout=timeout)
         self.assertEqual(result.returncode, expected, result.stderr)
         self.last_stderr = result.stderr
         return result.stdout.strip()
@@ -54,7 +57,7 @@ class BinaryTests(unittest.TestCase):
         self.assertEqual(actual, expected)
 
     def test_relocated_binary_without_python_full_and_incremental_restore(self):
-        self.assertEqual(self.run_binary("--version"), "tape-backup 0.3.0")
+        self.assertEqual(self.run_binary("--version"), "tape-backup 1.0.0")
         self.assertIn("/dev/nst0", self.run_binary("backup", "--help"))
         full = self.run_binary(*self.backup_args)
         self.assertIn("./change", self.last_stderr)
@@ -112,6 +115,45 @@ class BinaryTests(unittest.TestCase):
         self.assertNotIn("./change", self.last_stderr)
         self.assertIn("MiB/s", self.last_stderr)
         self.assertIn("ETA", self.last_stderr)
+
+    def test_binary_default_buffer_and_10_gib_limit(self):
+        args = ["backup", "--source", self.source, "--media-dir", self.media,
+                "--volume-size", "20GiB"]
+        self.run_binary(*args)
+        self.assertIn("buffer 1024 MiB", self.last_stderr)
+        full = self.run_binary(*args, "--buffer-size", "10GiB")
+        self.assertIn("buffer 10240 MiB", self.last_stderr)
+        self.restore([full])
+        self.run_binary(*args, "--buffer-size", str(10 * 1024**3 + 1), expected=1)
+        self.assertIn("64KiB and 10GiB", self.last_stderr)
+
+    @unittest.skipUnless(os.environ.get("TAPE_BACKUP_LARGE_TEST"),
+                         "Set TAPE_BACKUP_LARGE_TEST=1 for a 10 GiB streaming round trip")
+    def test_full_10_gib_stream_round_trip(self):
+        # Requires about 31 GiB of disk; frames stay small even with a 10 GiB budget.
+        if shutil.disk_usage(self.root).free < 31 * 1024**3:
+            self.skipTest('Need 31 GiB free for the large test; set TMPDIR to a disk-backed directory')
+        expected = hashlib.sha256()
+        block = b'x' * 1024**2
+        with (self.source / 'large').open('wb') as stream:
+            for _ in range(10 * 1024):
+                stream.write(block)
+                expected.update(block)
+        full = self.run_binary('backup', '--source', self.source, '--media-dir', self.media,
+                               '--volume-size', '20GiB', '--buffer-size', '10GiB', '--quiet', timeout=300)
+        with (self.media / f'{full}.0001.tape').open('rb') as stream:
+            stream.read(tb.BLOCK_SIZE)  # Volume header.
+            head = tb.decoded_header(stream.read(tb.BLOCK_SIZE))
+        self.assertEqual(head['length'], tb.FRAME_SIZE)
+        info = json.loads(self.run_binary('verify', '--backup', full, '--media-dir', self.media, timeout=300))
+        self.assertTrue(info['data_verified'])
+        destination = self.root / 'large-restored'
+        self.run_binary('restore', '--backup', full, '--media-dir', self.media,
+                        '--destination', destination, '--quiet', timeout=300)
+        with (destination / 'large').open('rb') as stream:
+            self.assertEqual(hashlib.file_digest(stream, 'sha256').hexdigest(), expected.hexdigest())
+        for name in ('keep', 'change', 'remove'):
+            self.assertEqual((destination / name).read_bytes(), (self.source / name).read_bytes())
 
     def test_legacy_restore_is_removed(self):
         self.assertNotIn("legacy-restore", self.run_binary("--help"))

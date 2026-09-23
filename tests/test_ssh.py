@@ -6,12 +6,14 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock, patch
 
 import tape_backup as tb
 from ssh_fixture import SSHServer
@@ -59,6 +61,17 @@ class SSHTests(unittest.TestCase):
         self.assertEqual((destination / "unchanged").stat().st_ino,
                          (destination / "hardlink").stat().st_ino)
 
+    def test_remote_accepts_10_gib_buffer_without_allocating_it_for_small_sources(self):
+        full = tb.backup(self.source, self.media, ssh=self.ssh,
+                         buffer_size=10 * 1024**3, quiet=True)
+        self.restore([full])
+
+    def test_old_ssh_protocol_is_rejected_before_tape_writing(self):
+        self.program.write_text("#!/bin/sh\nprintf 'TAPE-SSH-1\\n'\n")
+        with self.assertRaisesRegex(tb.BackupError, 'Unsupported SSH source protocol'):
+            self.create()
+        self.assertFalse(list(self.media.directory.glob('*.tape')))
+
     def test_remote_full_and_two_deltas_restore_without_remote_access(self):
         full = self.create()
         self.assertGreater(len(list(self.media.directory.glob(f"{full}.*.tape"))), 1)
@@ -91,7 +104,7 @@ class SSHTests(unittest.TestCase):
     def test_remote_stream_survives_tape_flush_failure_and_replay(self):
         self.media.fail_commit = True
         full = self.create()
-        self.assertIn("replaying chunk", self.output.getvalue())
+        self.assertIn("uncommitted chunk(s)", self.output.getvalue())
         self.restore([full])
 
     def test_remote_wrong_host_and_path_rejected_before_writing_new_tapes(self):
@@ -167,6 +180,58 @@ raise SystemExit(255)
 
 
 class SSHProtocolTests(unittest.TestCase):
+    def test_packet_lengths_above_4_gib_are_encoded_and_decoded_without_truncation(self):
+        # Exercise the framing boundaries without allocating multi-GiB payloads.
+        class SizedPayload:
+            def __init__(self, size):
+                self.size = size
+
+            def __len__(self):
+                return self.size
+
+        for size in (2**32, 2**32 + 1, 10 * 1024**3):
+            with self.subTest(size=size):
+                payload = SizedPayload(size)
+                output = Mock()
+                tb.send_packet(output, b'd', payload)
+                header = struct.pack('!cQ', b'd', size)
+                self.assertEqual(output.write.call_args_list[0].args, (header,))
+                self.assertIs(output.write.call_args_list[1].args[0], payload)
+                incoming = io.BytesIO(header)
+                read_exact = tb.read_exact
+
+                def read_payload(stream, count, progress=None):
+                    if stream.tell() == 0:
+                        return read_exact(stream, count)
+                    self.assertEqual(count, size)
+                    return payload
+
+                with patch.object(tb, 'read_exact', side_effect=read_payload):
+                    self.assertEqual(tb.receive_packet(incoming, size), (b'd', payload))
+                with self.assertRaisesRegex(tb.BackupError, 'exceeds'):
+                    tb.receive_packet(io.BytesIO(header), size - 1)
+
+    def test_packet_progress_updates_before_data_packet_is_complete(self):
+        progress = tb.Progress('Test')
+        observed = []
+
+        class ObservedStream(io.BytesIO):
+            def read(self, size):
+                observed.append(progress.read_bytes)
+                return super().read(size)
+
+        wire = io.BytesIO()
+        payload = b'x' * (2 * 1024**2 + 1)
+        tb.send_packet(wire, b'd', payload)
+        tb.send_packet(wire, b's', b'snapshot')
+        stream = ObservedStream(wire.getvalue())
+        self.assertEqual(tb.receive_packet(stream, len(payload), progress), (b'd', payload))
+        self.assertIn(1024**2, observed)
+        self.assertIn(2 * 1024**2, observed)
+        self.assertEqual(progress.read_bytes, len(payload))
+        self.assertEqual(tb.receive_packet(stream, len(payload), progress), (b's', b'snapshot'))
+        self.assertEqual(progress.read_bytes, len(payload))
+
     def test_source_cannot_finish_with_failed_exit_extra_output_or_reordered_data(self):
         for packets, exit_code, extra in (
                 ([(b'd', b'data'), (b's', b'snapshot'), (b'e', b'')], 1, b''),

@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.0.0 — 2026-09-23
+
+Major update: continuous streaming replaces per-chunk tape flushes. New backups
+use format 3 and require v1.0.0 to read. Format-2 backups remain readable; upgrade
+both ends of SSH backups. The default buffer budget is now 1 GiB per buffer.
+
+- Add continuous writes with small frames, a background read-ahead queue, and a
+  bounded recovery window. Increase the default buffer budget to 1 GiB and the
+  maximum to 10 GiB; each budget applies to both source read-ahead and retained
+  recovery data.
+- Use non-flushing SCSI READ POSITION reports to release confirmed tape records.
+  Remove per-frame filemark commits. Commit at volume boundaries, backup completion,
+  or when recovery space is exhausted without enough confirmed data. Fall back
+  safely when position tracking is unavailable; disable kernel async writes while
+  preserving drive buffering.
+- Introduce tape format 3 with recovery of multiple unconfirmed/duplicate frames.
+  Continue reading format 2, including large chunks, and support incremental chains
+  across versions. Format-3 metadata scans read past data records without filemark
+  spacing. New tapes require the updated reader.
+- Show buffer budget, queue occupancy, recovery bytes, confirmed archive bytes,
+  live source rate, reader state, and the reason for a flush in progress output.
+- Propagate source errors and stop tar/SSH and the reader thread on cancellation
+  or write failure. Do not stage archive data on disk.
+- Use version 2 of the SSH protocol with 64-bit packet lengths. Both ends of an
+  SSH backup should be updated; transport frames are now small regardless of the
+  tape host's buffer budget.
+- Fix manual tape-change prompts on non-seekable terminals and include the
+  underlying terminal error when a prompt cannot be opened.
+
 ## 0.3.0
 
 - Add `backup --ssh USER@HOST` to stream a remote Linux source to a local tape

@@ -1,10 +1,13 @@
 """Streaming format tests with real GNU tar and injected tape failures."""
 from contextlib import redirect_stderr
 import errno
+import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import pty
+import select
 import shutil
 import stat
 import struct
@@ -12,6 +15,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch, Mock
@@ -125,7 +130,7 @@ class StreamingTests(unittest.TestCase):
             for index, (kind, chunk) in enumerate(actual_frames(*args)):
                 if kind == "data":
                     counts.append(len(chunk))
-                    if index:
+                    if index >= 2:  # The reader may fill one chunk ahead of the writer.
                         self.assertGreater(sum(p.stat().st_size for p in self.media.directory.glob('*.tape')),
                                            tb.BLOCK_SIZE)
                 yield kind, chunk
@@ -141,6 +146,73 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual(tree_contents(self.source), tree_contents(self.destination))
         self.assertEqual((self.destination/'executable').stat().st_ino,
                          (self.destination/'hardlink').stat().st_ino)
+
+    def test_background_reader_fills_next_chunk_during_write_but_cannot_read_a_third(self):
+        self.seed()
+        second_ready, third_started = threading.Event(), threading.Event()
+        actual_frames, actual_send = tb.archive_frames, tb.StreamWriter.send
+        checked = False
+
+        def observe(*args):
+            for index, frame in enumerate(actual_frames(*args)):
+                if index == 1:
+                    second_ready.set()
+                elif index == 2:
+                    third_started.set()
+                yield frame
+
+        def send(writer, kind, chunk):
+            nonlocal checked
+            if kind == 'data' and not checked:
+                checked = True
+                self.assertTrue(second_ready.wait(3), 'Source did not read ahead during the write')
+                self.assertFalse(third_started.wait(0.1), 'More than two chunks were read')
+            return actual_send(writer, kind, chunk)
+
+        with patch.object(tb, 'archive_frames', side_effect=observe), \
+                patch.object(tb.StreamWriter, 'send', send):
+            full = self.create()
+        self.assertTrue(checked)
+        self.extract([full])
+        self.assertEqual(tree_contents(self.source), tree_contents(self.destination))
+
+    def test_background_reader_failure_does_not_publish_completion(self):
+        self.seed()
+        actual_frames = tb.archive_frames
+
+        def fail(*args):
+            frames = actual_frames(*args)
+            try:
+                yield next(frames)
+                raise tb.BackupError('Injected background source failure')
+            finally:
+                frames.close()
+
+        with patch.object(tb, 'archive_frames', side_effect=fail), \
+                self.assertRaisesRegex(tb.BackupError, 'background source failure'):
+            self.create()
+        backup_id = self.media.loads[0][0]
+        with self.assertRaises(tb.BackupError):
+            tb.scan(self.media, backup_id)
+
+    def test_writer_failure_stops_local_archive_and_background_reader(self):
+        self.seed()
+        processes = []
+        actual_start = tb.start_archive
+
+        def start(*args):
+            process = actual_start(*args)
+            processes.append(process)
+            return process
+
+        with patch.object(tb, 'start_archive', side_effect=start), \
+                patch.object(tb.StreamWriter, 'send', side_effect=tb.BackupError('Writer failed')), \
+                self.assertRaisesRegex(tb.BackupError, 'Writer failed'):
+            self.create()
+        self.assertEqual(len(processes), 1)
+        self.assertIsNotNone(processes[0].poll())
+        self.assertTrue(processes[0].stdout.closed)
+        self.assertFalse(any(t.name == 'tape-backup-reader' for t in threading.enumerate()))
 
     def test_two_incrementals_use_snapshot_on_tape_and_restore_changes(self):
         self.seed()
@@ -301,6 +373,42 @@ class StreamingTests(unittest.TestCase):
         with self.assertRaisesRegex(tb.BackupError, 'separate'):
             tb.backup(self.source, tb.FileMedia(self.source/'media'), quiet=True)
 
+    def test_large_archive_uses_small_frames_and_supports_incrementals(self):
+        source = self.source / 'large'
+        block = b'x' * 1024**2
+        expected = hashlib.sha256()
+        with source.open('wb') as stream:
+            for _ in range(257):
+                stream.write(block)
+                expected.update(block)
+        full = tb.backup(self.source, self.media, quiet=True)
+        summary = tb.scan(self.media, full)
+        self.assertGreater(summary['data_bytes'], 256 * 1024**2)
+        self.assertGreater(summary['chunks'], 64)
+        with (self.media.directory / f'{full}.0001.tape').open('rb') as stream:
+            self.assertEqual(tb.decoded_header(stream.read(tb.BLOCK_SIZE))['format'], 3)
+            self.assertEqual(tb.decoded_header(stream.read(tb.BLOCK_SIZE))['length'], tb.FRAME_SIZE)
+        self.assertTrue(summary['data_verified'])
+        (self.source / 'added').write_text('incremental data')
+        delta = self.create(base=full, limit=None)
+        self.extract([full, delta])
+        with (self.destination / 'large').open('rb') as stream:
+            self.assertEqual(hashlib.file_digest(stream, 'sha256').hexdigest(), expected.hexdigest())
+        self.assertEqual((self.destination / 'added').read_text(), 'incremental data')
+
+    def test_buffer_limit_and_default_from_cli(self):
+        parser = tb.make_parser()
+        default = parser.parse_args(['backup', '--source', str(self.source)])
+        self.assertEqual(default.buffer_size, 1024**3)
+        maximum = parser.parse_args(['backup', '--source', str(self.source), '--buffer-size', '10GiB'])
+        self.assertEqual(maximum.buffer_size, 10 * 1024**3)
+        (self.source / 'small').write_text('Small archives do not allocate the full buffer.')
+        full = self.create(buffer=maximum.buffer_size, limit=None)
+        self.extract([full])
+        self.assertEqual(tree_contents(self.source), tree_contents(self.destination))
+        with self.assertRaisesRegex(tb.BackupError, '64KiB and 10GiB'):
+            self.create(buffer=10 * 1024**3 + 1, limit=None)
+
     def test_existing_destination_is_not_overwritten(self):
         full = self.create()
         self.destination.mkdir()
@@ -340,7 +448,7 @@ class StreamingTests(unittest.TestCase):
         with patch.object(Path, 'read_text', return_value='0x8000'), \
                 patch.object(tb, 'run_command') as mt:
             media.mt('rewind')
-            self.assertEqual(mt.call_args_list[0].args, (['mt', '-f', '/dev/nst1', 'stclearoptions', '0xa000'],))
+            self.assertEqual(mt.call_args_list[0].args, (['mt', '-f', '/dev/nst1', 'stclearoptions', '0xa002'],))
             self.assertEqual(mt.call_args_list[1].args, (['mt', '-f', '/dev/nst1', 'rewind'],))
 
     def test_eta_uses_payload_completion_and_reports_measured_rate(self):
@@ -391,6 +499,170 @@ class StreamingTests(unittest.TestCase):
             ['/loader', 'write', 'a'*32, '2', '/dev/nst1'],
             ['mt', '-f', '/dev/nst1', 'rewind'], ['mt', '-f', '/dev/nst1', 'setblk', '0'],
             ['mt', '-f', '/dev/nst1', 'offline']])
+
+    def test_manual_tape_changes_use_a_nonseekable_terminal(self):
+        for writing, response in ((True, b'\n'), (False, b'\n'),
+                                  (True, b'q\n'), (True, b'\x04')):
+            with self.subTest(writing=writing, response=response):
+                master, slave = pty.openpty()
+                try:
+                    terminal = os.ttyname(slave)
+                    media = object.__new__(tb.TapeMedia)
+                    media.device = '/dev/nst1'
+                    media.media_command = None
+                    media.mt = Mock()
+
+                    def terminal_open(path, *args, **kwargs):
+                        self.assertEqual(path, '/dev/tty')
+                        return open(terminal, *args, **kwargs,
+                                    opener=lambda path, flags: os.open(path, flags | os.O_NOCTTY))
+
+                    os.write(master, response)
+                    with patch.object(tb, 'open', terminal_open, create=True):
+                        if response == b'\n':
+                            media.load('a'*32, 2, writing)
+                        else:
+                            with self.assertRaisesRegex(tb.BackupError, 'cancelled'):
+                                media.load('a'*32, 2, writing)
+                    self.assertTrue(select.select([master], [], [], 2)[0], 'Missing tape prompt')
+                    prompt = os.read(master, 4096).decode()
+                    action = 'write' if writing else 'read'
+                    self.assertIn(f"Load {'a'*32} volume 2 into /dev/nst1 for {action}", prompt)
+                    self.assertIn('Press Enter when ready, or type q to stop:', prompt)
+                    self.assertEqual('CONTENTS WILL BE OVERWRITTEN' in prompt, writing)
+                    if response == b'\n':
+                        self.assertEqual([call.args for call in media.mt.call_args_list],
+                                         [('rewind',), ('setblk', '0')])
+                    else:
+                        media.mt.assert_not_called()
+                finally:
+                    os.close(master)
+                    os.close(slave)
+
+    def test_missing_terminal_reports_cause_without_touching_tape(self):
+        media = object.__new__(tb.TapeMedia)
+        media.device = '/dev/nst1'
+        media.media_command = None
+        media.mt = Mock()
+        error = OSError(errno.ENXIO, 'No such device or address', '/dev/tty')
+        with patch.object(tb, 'open', side_effect=error, create=True), \
+                self.assertRaisesRegex(tb.BackupError, 'No terminal.*No such device or address'):
+            media.load('a'*32, 1, True)
+        media.mt.assert_not_called()
+
+
+class ReadAheadTests(unittest.TestCase):
+    def test_partial_next_chunk_is_visible_while_writer_holds_current_chunk(self):
+        progress = tb.Progress('Test', buffer_size=4 * 1024**2)
+        partial, resume = threading.Event(), threading.Event()
+
+        class SlowStream:
+            reads = 0
+
+            def read(self, size):
+                self.reads += 1
+                if self.reads <= 5:
+                    return b'x' * 1024**2
+                partial.set()  # One MiB of the second chunk has been counted.
+                if not resume.wait(3):
+                    raise AssertionError('Reader was not released')
+                return b''
+
+        def source():
+            for chunk in tb.read_chunks(SlowStream(), 4 * 1024**2, progress):
+                yield 'data', chunk
+
+        reader = tb.ReadAhead(source(), resume.set, progress)
+        with reader as frames:
+            kind, chunk = next(frames)
+            self.assertEqual(len(chunk), 4 * 1024**2)
+            self.assertTrue(partial.wait(3))
+            self.assertEqual(progress.read_bytes, 5 * 1024**2)
+            self.assertEqual(progress.reader_state, 'reading')
+            progress.phase = 'writing volume 1, chunk 0'
+            output = io.StringIO()
+            with redirect_stderr(output):
+                progress.report()
+            self.assertIn('5.0 MiB read', output.getvalue())
+            self.assertIn('writing volume 1, chunk 0', output.getvalue())
+            self.assertIn('reader reading', output.getvalue())
+            self.assertIn('MiB/s source', output.getvalue())
+            del chunk
+            resume.set()
+            remaining = list(frames)
+            self.assertEqual(len(remaining), 1)
+            self.assertEqual(len(remaining[0][1]), 1024**2)
+        self.assertEqual(progress.read_bytes, 5 * 1024**2)
+        self.assertEqual(progress.reader_state, 'finished')
+
+    def test_full_buffers_are_reported_as_reader_waiting(self):
+        progress = tb.Progress('Test')
+
+        def source():
+            for chunk in tb.read_chunks(io.BytesIO(b'abc'), 1, progress):
+                yield 'data', chunk
+
+        reader = tb.ReadAhead(source(), lambda: None, progress)
+        with reader as frames:
+            self.assertEqual(next(frames), ('data', b'a'))
+            with reader.condition:
+                ready = reader.condition.wait_for(
+                    lambda: progress.reader_state == 'waiting (buffers full)', timeout=3)
+            self.assertTrue(ready)
+            self.assertEqual(progress.read_bytes, 2)
+        self.assertFalse(reader.thread.is_alive())
+
+    def test_source_error_is_reported_after_queued_data(self):
+        error = tb.BackupError('Source failed')
+        closed = threading.Event()
+        progress = tb.Progress('Test')
+
+        def source():
+            try:
+                for chunk in tb.read_chunks(io.BytesIO(b'first'), 5, progress):
+                    yield 'data', chunk
+                raise error
+            finally:
+                closed.set()
+
+        reader = tb.ReadAhead(source(), lambda: None, progress)
+        with reader as frames:
+            self.assertEqual(next(frames), ('data', b'first'))
+            with self.assertRaises(tb.BackupError) as raised:
+                next(frames)
+            self.assertIs(raised.exception, error)
+        self.assertEqual(progress.read_bytes, 5)
+        self.assertTrue(closed.is_set())
+        self.assertFalse(reader.thread.is_alive())
+
+    def test_cancellation_unblocks_pipe_reader_and_closes_source(self):
+        process = subprocess.Popen(
+            [sys.executable, '-c', "import os, signal; signal.alarm(10); os.write(1, b'x'); os.read(0, 1)"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.addCleanup(tb.stop_process, process)
+        blocked, closed = threading.Event(), threading.Event()
+
+        def source():
+            try:
+                yield 'data', process.stdout.read(1)
+                blocked.set()
+                yield 'data', process.stdout.read(1)
+            finally:
+                tb.stop_process(process)
+                closed.set()
+
+        reader = tb.ReadAhead(source(), lambda: tb.stop_process(process, close_streams=False),
+                              tb.Progress('Test'))
+        started = time.monotonic()
+        with self.assertRaises(KeyboardInterrupt):
+            with reader as frames:
+                self.assertEqual(next(frames), ('data', b'x'))
+                self.assertTrue(blocked.wait(3))
+                raise KeyboardInterrupt
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertTrue(closed.is_set())
+        self.assertFalse(reader.thread.is_alive())
+        self.assertIsNotNone(process.poll())
 
 
 if __name__ == '__main__':

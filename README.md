@@ -12,12 +12,16 @@ to select another non-rewinding tape drive.
 
 ## Download
 
+Version 1.0.0 implements continuous streaming with small frames, background
+read-ahead, and buffers up to 10 GiB. It writes tape format 3 and reads existing
+format-2 backups.
+
 Download the executable and checksum from the
-[v0.3.0 release](https://github.com/lbadger/tape-backup/releases/tag/v0.3.0):
+[v1.0.0 release](https://github.com/lbadger/tape-backup/releases/tag/v1.0.0):
 
 ```bash
-curl -fLO https://github.com/lbadger/tape-backup/releases/download/v0.3.0/tape-backup
-curl -fLO https://github.com/lbadger/tape-backup/releases/download/v0.3.0/tape-backup.sha256
+curl -fLO https://github.com/lbadger/tape-backup/releases/download/v1.0.0/tape-backup
+curl -fLO https://github.com/lbadger/tape-backup/releases/download/v1.0.0/tape-backup.sha256
 sha256sum --check tape-backup.sha256
 chmod +x tape-backup
 ./tape-backup --version
@@ -31,9 +35,10 @@ build. Running the source script requires Python 3.11+.
 
 Use a Linux SCSI tape drive supporting variable-length 64 KiB records. The user
 must have permission to operate the device. The script disables immediate rewind
-and filemark modes when necessary; changing those driver settings may require
-root. Run it with exclusive access to the drive. Locks prevent competing jobs
-under the same Unix account, but cannot exclude other tape programs or accounts.
+and filemark modes, plus kernel asynchronous writes, when necessary; changing
+those driver settings may require root. Run it with exclusive access to the drive.
+Locks prevent competing jobs under the same Unix account, but cannot exclude other
+tape programs or accounts.
 
 ## Full backup
 
@@ -80,10 +85,11 @@ file, then writes a new backup to fresh tapes:
 ```
 
 Load the previous backup's volumes in order when prompted, followed by fresh
-writable tapes for the new backup. The metadata reader uses tape filemarks to
-skip archive payloads, avoiding transfer of the old file contents through RAM.
-Mechanical tape traversal still takes time. No persistent snapshot/cache file is
-required. Metadata memory consumption grows with the number of filenames.
+writable tapes for the new backup. Format-3 metadata scans read past archive
+records without keeping or hashing their payloads; there are no per-chunk
+filemarks to skip. Format-2 tapes still use filemark spacing. This can make loading
+a format-3 incremental base slower. No persistent snapshot/cache file is required.
+Metadata memory consumption grows with the number of filenames.
 
 Each incremental is relative to the backup specified by `--base`. For a linear
 chain, pass the most recent successful backup ID. The source directory must match.
@@ -177,14 +183,31 @@ File names are printed by default. A status line is printed every five seconds
 and at completion, for example:
 
 ```text
-BACKUP_ID: streaming to volume 1; 8192.0 MiB read, 8128.0 MiB delivered; 155.0 MiB/s I/O, 149.3 MiB/s average; ETA ~02:14:08 (current archive); 55s elapsed
+BACKUP_ID: writing volume 1, chunk 1792; 8192.0 MiB read, 7168.0 MiB delivered; buffer 1024 MiB; queued 1020.0 MiB, recovery 130.0 MiB, committed 7040.0 MiB; reader reading, 180.0 MiB/s source; 155.0 MiB/s I/O, 149.3 MiB/s average; ETA ~02:14:08 (current archive); 55s elapsed
 ```
+
+Backup status shows the configured buffer budget, queued payload bytes, recovery
+bytes retained (including framing), and archive bytes confirmed on media. Each of
+the read-ahead and recovery buffers has that budget; `--volume-size` can reduce
+the recovery budget. The active writer frame and partly filled reader frame are
+not included in the queued count.
+
+During backup, bytes read update after each source read of up to 1 MiB, including
+partially filled chunks. Source MiB/s measures archive bytes received from GNU tar
+or SSH over the reporting interval; it excludes SSH framing and snapshot metadata.
+The reader reports `reading`, `waiting (buffers full)`, or `finished` separately
+from the writer's phase. `waiting for source` means the writer needs another
+small frame; `flushing` identifies a volume boundary, backup completion, or a full
+recovery buffer awaiting confirmation. A zero tape I/O rate alone does not
+indicate whether source reads are still progressing.
 
 I/O rates measure bytes passed to/from the device, including framing, padding,
 and retries. They are host-side rates, not measurements of physical tape motion
-or compressed media capacity. Delivered backup bytes have passed a synchronous
-filemark flush. Restore delivery counts archive bytes passed to GNU tar. The
-average includes elapsed media-change time.
+or compressed media capacity. Delivered backup bytes have been accepted by the
+writer; they may still be buffered in the drive. Committed bytes have been
+confirmed on tape by READ POSITION or a synchronous filemark flush. Replay does
+not double-count either logical counter. Restore delivery counts archive bytes
+passed to GNU tar. The average includes elapsed media-change time.
 
 The ETA estimates remaining time for the **current archive**, not later
 incrementals in a restore chain. Backup estimates come from file metadata only;
@@ -199,26 +222,65 @@ errors. Large-file transfers still produce periodic status lines.
 
 ## Bounded buffering and failure recovery
 
-The default retry chunk is 64 MiB; adjust it with `--buffer-size`, between 64 KiB
-and 256 MiB. The payload buffer is bounded independently of archive size. Peak
-memory also includes Python/GNU tar overhead, temporary chunk copies, and the
-incremental snapshot metadata. The volume cap can reduce the effective chunk
-size. Larger chunks reduce filemark overhead; smaller chunks reduce RAM use and
-retry work.
+The default buffer budget is 1 GiB; adjust it with `--buffer-size`, between 64 KiB
+and 10 GiB. For example:
 
-Each chunk has an identifier, length, checksum, and link to the preceding chunk.
-The writer retains it in RAM until a synchronous tape filemark commits it. On a
-short write, end-of-tape indication, or write I/O error, it requests another tape
-and replays the pending chunk. **Keep the earlier volume**, including one that
-ended in a write error: it may contain previously committed data. Restore handles
-an incomplete tail or a complete duplicate chunk after a failed flush. Repeated
-failures without progress stop the job.
+```bash
+./tape-backup backup --source /opt --level full --buffer-size 10GiB
+```
+
+The background reader feeds a bounded queue of small frames (normally 4 MiB),
+while the writer drains it continuously. Writing starts with the first frame;
+it does not wait for the entire buffer budget to fill. Free queue slots are
+refilled individually during writes and tape changes. Whole-archive checksums
+are updated incrementally; individual frames also carry checksums and chain links.
+
+There is no synchronous filemark after every frame. On supported physical drives,
+SCSI READ POSITION reports which records have reached the medium without flushing
+the drive. Only complete frames below that position are released from the recovery
+buffer. The accepted-write position is checked against our record count, and the
+medium position must never move backwards. Kernel asynchronous writes are disabled
+to keep these counts aligned; the drive buffering setting is preserved.
+
+The writer commits at volume boundaries and backup completion. It also commits if
+the recovery buffer fills before the drive confirms enough data. This fallback is
+necessary when position reporting is unsupported, unavailable, inconsistent, or
+the buffer is too small for the drive's unconfirmed tail. Linux SG_IO access may
+require root/CAP_SYS_RAWIO. The startup log reports unavailable position tracking;
+status identifies fallback flushes as `recovery buffer full`. File-backed media
+uses the same fallback with fsync instead of hardware position reports. A source
+that cannot keep up, media changes, and drive behavior can still cause pauses.
+
+The source queue and recovery window each use up to the selected budget, plus a
+few active frames, allocation overhead, Python/GNU tar memory, and incremental
+snapshot metadata. Allow more than 2 GiB of RAM at the default, or more than 20 GiB
+with a 10 GiB budget. Very small budgets still allow one active frame and one queued
+frame, and at least 128 KiB of recovery framing. Allocation grows on demand.
+The SSH source only needs small transport frames and its snapshot metadata.
+Format-3 restore holds a small frame plus a bounded history of header digests;
+legacy format-2 restore can still require RAM for large legacy chunks.
+
+On a short write, end-of-tape indication, or write/position I/O error, the writer
+requests another tape and replays **every unconfirmed frame**, including the
+partially written frame. Keep earlier volumes: they contain the confirmed prefix
+and may also contain some or all of the replayed tail. Restore validates the chain
+and each replayed header before suppressing duplicates, so several overlapping
+frames across replacement volumes are safe. Repeated failures without confirmed
+progress stop the job.
 
 A final completion marker is written only after GNU tar exits successfully and
-the new incremental snapshot has been recorded. Missing chunks, wrong tapes,
-checksum failures, and incomplete sets are rejected. Backup flushes each chunk
-but does not perform automatic read-back verification; use `verify` for a full
-read pass.
+the new incremental snapshot has been recorded. Backup reports success only after
+the final synchronous commit. Missing frames, wrong tapes, checksum failures, and
+incomplete sets are rejected. Backup does not perform automatic read-back
+verification; use `verify` for a full read pass.
+
+New backups use **format 3** and require v1.0.0 for restore,
+inspect, verify, and incremental-base reading. Existing format-2 tapes from
+v0.2/v0.3 and earlier 0.4 development builds remain readable, including chunks up
+to 10 GiB. Incremental chains may cross from format 2 to format 3. Update both ends
+of SSH backups; the transport uses 64-bit version-2 packet framing.
+
+See the [continuous-streaming design and validation plan](docs/continuous-streaming.md).
 
 **A stopped/killed process or power failure requires restarting the backup from
 the source on fresh media.** There is no persistent byte-resume checkpoint. The
@@ -249,10 +311,11 @@ when it reaches and validates the completion marker.
 
 ## Supported tape formats
 
-This release reads streaming tapes created by v0.2 and v0.3. The legacy restore
-command and disk-staging implementation have been removed. To restore v0.1 tapes,
-use the [v0.1.0 release](https://github.com/lbadger/tape-backup/releases/tag/v0.1.0)
-with their original catalogs. Start a new full backup when migrating from v0.1.
+Version 1.0.0 writes format 3 and reads both format 3 and format 2 streaming tapes
+created by v0.2, v0.3, and earlier 0.4 development builds. The legacy restore command
+and disk-staging implementation have been removed. To restore v0.1 tapes, build
+the [v0.1.0 source tag](https://github.com/lbadger/tape-backup/tree/v0.1.0) and use
+the original catalogs. Start a new full backup when migrating from v0.1.
 
 ## Automated tape loading
 
@@ -289,6 +352,10 @@ full_id=$(./tape-backup backup --source ./sample-data --media-dir ./demo-tapes \
 # SSH integration tests need ssh, ssh-keygen, and sshd (openssh-client/server).
 TAPE_BACKUP_BINARY="$PWD/dist/tape-backup" python3 -m unittest discover -s tests -v
 
+# Optional 10 GiB streaming round trip (about 31 GiB disk and >20 GiB free RAM).
+TMPDIR="$PWD" TAPE_BACKUP_BINARY="$PWD/dist/tape-backup" TAPE_BACKUP_LARGE_TEST=1 \
+  python3 -m unittest discover -s tests -p test_binary.py -k full_10_gib -v
+
 # Test in Debian 11 without Python installed.
 docker run --rm --network none \
   -v "$PWD/dist:/opt/tape-backup:ro" \
@@ -305,14 +372,15 @@ metadata, ETA/rates, end-of-medium rollover, short writes, synchronous flush
 failures, lost buffered tails, duplicate replay, corruption, incomplete tapes,
 chain validation, SSH full/delta restores, host-key verification, remote failures,
 connection loss, and standalone binaries at both ends. SSH tests launch a
-temporary loopback server with isolated keys/configuration. Physical tape hardware
-has not been exercised: qualify your drive and loader with scratch media before
-relying on it.
+temporary loopback server with isolated keys/configuration. Automated tape checks
+use simulated media; qualify end-of-medium recovery and restore on your drive
+and loader with scratch media before relying on them.
 
-The format uses 64 KiB records with checksummed headers; each volume header and
-each chunk is a separate tape file. Archive payloads are GNU incremental tar
-streams; the surrounding version-2 framing is specific to this tool. Use this
-script to restore these volumes, rather than invoking tar directly on the device.
+Format 3 uses 64 KiB records with checksummed headers and payload frames up to
+4 MiB. Frames share a tape file between explicit commits. Archive payloads are
+GNU incremental tar streams; the surrounding framing is specific to this tool.
+Use this script to restore these volumes, rather than invoking tar directly on
+the device.
 
 See [GNU tar incremental semantics](https://www.gnu.org/software/tar/manual/html_node/Incremental-Dumps.html)
 and the [Linux SCSI tape driver](https://www.kernel.org/doc/html/latest/scsi/st.html)
