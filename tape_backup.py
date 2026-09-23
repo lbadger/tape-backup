@@ -30,15 +30,14 @@ MAX_BUFFER = 10 * 1024**3
 FRAME_SIZE = 4 * 1024**2
 POSITION_INTERVAL = 16 * 1024**2
 MAGIC = b"TAPE-STREAM-3\n"
-LEGACY_MAGIC = b"TAPE-STREAM-2\n"
 ZERO_CHAIN = "0" * 64
 PROGRAM_VERSION = "1.0.0"
 # Linux struct mtop: short operation, padding, int count (x86-64 / AArch64).
 MTIOCTOP = 0x40086D01
-MTFSF, MTWEOF = 1, 5
+MTWEOF = 5
 RECOVERABLE = (errno.ENOSPC, errno.EIO)
 SSH_MAGIC = b"TAPE-SSH-2\n"
-# A chunk may exceed the 4 GiB range of the original SSH packet length.
+# Current SSH transport uses a 64-bit payload length.
 PACKET_HEADER = struct.Struct("!cQ")
 
 
@@ -117,24 +116,23 @@ def valid_id(value):
     return value
 
 
-def encoded_header(fields, magic=MAGIC):
+def encoded_header(fields):
     payload = json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()
     envelope = json.dumps({"fields": fields, "sha256": hashlib.sha256(payload).hexdigest()},
                           sort_keys=True, separators=(",", ":")).encode()
-    record = magic + envelope + b"\n"
+    record = MAGIC + envelope + b"\n"
     if len(record) > BLOCK_SIZE:
         raise BackupError("Tape metadata header exceeds 64 KiB")
     return record.ljust(BLOCK_SIZE, b"\0")
 
 
 def decoded_header(record):
-    magic = LEGACY_MAGIC if record.startswith(LEGACY_MAGIC) else MAGIC
-    if len(record) != BLOCK_SIZE or not record.startswith(magic):
+    if len(record) != BLOCK_SIZE or not record.startswith(MAGIC):
         raise BackupError("Wrong tape format or corrupt record header")
     try:
-        envelope = json.loads(record[len(magic):].rstrip(b"\0\n"))
+        envelope = json.loads(record[len(MAGIC):].rstrip(b"\0\n"))
         fields = envelope["fields"]
-        if not isinstance(fields, dict) or encoded_header(fields, magic) != record:
+        if not isinstance(fields, dict) or encoded_header(fields) != record:
             raise ValueError("metadata checksum mismatch")
         return fields
     except (TypeError, ValueError, KeyError) as exc:
@@ -321,16 +319,9 @@ class Volume:
             raise EndVolume
         return record
 
-    def skip_payload(self, length, *, filemarks=True):
+    def skip_payload(self, length):
         """Skip file data when loading a snapshot; this does not verify data."""
-        if self.physical and filemarks:
-            try:
-                fcntl.ioctl(self.stream.fileno(), MTIOCTOP, struct.pack("@hi", MTFSF, 1))
-            except OSError as exc:
-                if exc.errno in RECOVERABLE:
-                    raise EndVolume from exc
-                raise
-        elif self.physical:
+        if self.physical:
             for _ in range((length + BLOCK_SIZE - 1) // BLOCK_SIZE):
                 self.read()
         else:
@@ -597,8 +588,7 @@ class StreamReader:
         self.volume = self.job = None
         self.number = self.sequence = 0
         self.chain = ZERO_CHAIN
-        self.last_header = self.summary = None
-        self.format = None
+        self.summary = None
         self.replay_limit = self.history_bytes = 0
         self.history = OrderedDict()
 
@@ -619,17 +609,16 @@ class StreamReader:
             head = decoded_header(self.volume.read(boundary=True))
             job = head["backup"]
             valid_id(job["id"])
-            if (head["type"] != "volume" or head["format"] not in (2, 3) or head["volume"] != self.number or
+            if head["format"] != 3:
+                raise ValueError("unsupported tape format; only format 3 is supported")
+            if (head["type"] != "volume" or head["volume"] != self.number or
                     (self.backup_id is not None and job["id"] != self.backup_id)):
                 raise ValueError("wrong backup or volume number")
-            if self.format is not None and head["format"] != self.format:
-                raise ValueError("tape format changed between volumes")
-            if head["format"] == 3:
-                limit = head["replay_bytes"]
-                if (type(limit) is not int or not 2 * BLOCK_SIZE <= limit <= MAX_BUFFER or
-                        (self.replay_limit and limit != self.replay_limit)):
-                    raise ValueError("invalid recovery window")
-                self.replay_limit = limit
+            limit = head["replay_bytes"]
+            if (type(limit) is not int or not 2 * BLOCK_SIZE <= limit <= MAX_BUFFER or
+                    (self.replay_limit and limit != self.replay_limit)):
+                raise ValueError("invalid recovery window")
+            self.replay_limit = limit
             if job["level"] not in ("full", "incremental") or not isinstance(job["source"], str):
                 raise ValueError("invalid backup metadata")
             if job["level"] == "full" and job["parent"] is not None:
@@ -640,12 +629,7 @@ class StreamReader:
                 raise ValueError("volume belongs to a different backup")
             if type(head["sequence"]) is not int:
                 raise ValueError("invalid sequence")
-            if head["format"] == 2:
-                replay = self.last_header is not None and head["sequence"] == self.sequence - 1
-                previous = self.last_header["previous"] if replay else self.chain
-                if head["sequence"] != self.sequence - int(replay) or head["previous"] != previous:
-                    raise ValueError("missing or reordered chunks between tapes")
-            elif head["sequence"] == self.sequence:
+            if head["sequence"] == self.sequence:
                 if head["previous"] != self.chain:
                     raise ValueError("broken chain between tapes")
             elif (head["sequence"] not in self.history or
@@ -654,7 +638,6 @@ class StreamReader:
         except (KeyError, TypeError, ValueError, EndVolume) as exc:
             raise BackupError(f"Wrong or incomplete volume {self.number}: {exc}") from exc
         self.job, self.backup_id = job, job["id"]
-        self.format = head["format"]
         self.volume_sequence, self.volume_chain = head["sequence"], head["previous"]
 
     def frames(self, *, skip_data=False):
@@ -671,7 +654,7 @@ class StreamReader:
                 try:
                     if (head["type"] != "chunk" or head["kind"] not in ("data", "snapshot", "end") or
                             type(head["length"]) is not int or
-                            not 0 < head["length"] <= (MAX_BUFFER if self.format == 2 else FRAME_SIZE) or
+                            not 0 < head["length"] <= FRAME_SIZE or
                             type(head["sequence"]) is not int or
                             not re.fullmatch(r"[0-9a-f]{64}", head["sha256"])):
                         raise ValueError("invalid chunk fields")
@@ -680,8 +663,7 @@ class StreamReader:
                     if head["sequence"] != self.volume_sequence or head["previous"] != self.volume_chain:
                         raise ValueError("missing, reordered or corrupt chunk")
                     if duplicate:
-                        known = (head == self.last_header if self.format == 2 else
-                                 head["sequence"] in self.history and
+                        known = (head["sequence"] in self.history and
                                  self.history[head["sequence"]][1] == digest)
                         if not known:
                             raise ValueError("replayed chunk differs from the original")
@@ -690,7 +672,7 @@ class StreamReader:
                 except (KeyError, TypeError, ValueError) as exc:
                     raise BackupError(f"Invalid chunk header: {exc}") from exc
                 if skip_data and head["kind"] == "data":
-                    self.volume.skip_payload(head["length"], filemarks=self.format == 2)
+                    self.volume.skip_payload(head["length"])
                     payload = None
                 else:
                     payload = bytearray()
@@ -715,17 +697,15 @@ class StreamReader:
             self.volume_chain = digest
             if duplicate:
                 continue  # Several complete frames may survive a delayed error.
-            self.last_header = head
             self.sequence += 1
             self.chain = digest
-            if self.format == 3:
-                size = BLOCK_SIZE + ((head["length"] + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
-                if size > self.replay_limit:
-                    raise BackupError("Chunk exceeds the declared recovery window")
-                self.history[head["sequence"]] = (head["previous"], digest, size)
-                self.history_bytes += size
-                while self.history_bytes > self.replay_limit:
-                    self.history_bytes -= self.history.popitem(last=False)[1][2]
+            size = BLOCK_SIZE + ((head["length"] + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+            if size > self.replay_limit:
+                raise BackupError("Chunk exceeds the declared recovery window")
+            self.history[head["sequence"]] = (head["previous"], digest, size)
+            self.history_bytes += size
+            while self.history_bytes > self.replay_limit:
+                self.history_bytes -= self.history.popitem(last=False)[1][2]
             if head["kind"] == "data":
                 if phase != "data":
                     raise BackupError("File data appears after the incremental snapshot")

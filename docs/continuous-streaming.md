@@ -11,10 +11,10 @@ could not remove the per-chunk barrier.
 2. Track a bounded window of unconfirmed writes. Query the drive's medium position
    without flushing; release only fully confirmed frames. Keep a synchronous
    fallback for missing telemetry or a recovery window that fills.
-3. Introduce format 3, remove per-frame filemarks, and allow multi-frame overlap on
-   replacement volumes. Keep version-2 readers and incremental compatibility.
+3. Use format 3, remove per-frame filemarks, and allow multi-frame overlap on
+   replacement volumes.
 4. Report queue occupancy, recovery occupancy, confirmed bytes, and flush reasons.
-5. Exercise delayed failures, corruption, tape rollover, legacy restores, SSH,
+5. Exercise delayed failures, corruption, tape rollover, format validation, SSH,
    and the standalone build before publishing the implementation result.
 
 Steps 1–5 are implemented and automated validation has passed. Physical tape
@@ -69,10 +69,11 @@ Three consecutive volumes without confirmed frame progress stop the backup. A
 failed volume-header initialization aborts immediately: skipping that numbered
 volume would create an unreadable tape set.
 
-## Format and compatibility
+## Format
 
-Format 3 has `TAPE-STREAM-3` checksummed headers, small payload frames, and a bounded
-`replay_bytes` declaration in every volume header. Readers keep a bounded history
+Format 3 is the only supported tape format. It has `TAPE-STREAM-3` checksummed
+headers, small payload frames, and a bounded `replay_bytes` declaration in every
+volume header. Readers keep a bounded history
 of sequence numbers and header digests, not old payloads. An overlapping frame must
 match its remembered header exactly; payload checksums and the full archive digest
 are also checked during verify/restore. Gaps, reordered or changed duplicates, and
@@ -81,9 +82,9 @@ counts and are delivered to tar.
 
 Filemarks occur only at commit boundaries. Metadata-only reading can seek over
 file-backed records but must read/discard physical tape records in format 3.
-Format 2 retains its original filemark-based skipping and one-frame replay rules,
-and permits its older large chunks. Restore extracts privately and publishes only
-a fully validated chain. Mixed format-2/format-3 incremental chains are supported.
+Restore extracts privately and publishes only a fully validated chain. Other
+format prefixes or volume format declarations are rejected. Format-3 backups
+created by v1.0.0 remain readable without any conversion.
 
 ## Validation
 
@@ -92,13 +93,13 @@ accepted writes ahead of its durable position. They cover continuous writes with
 only header/final commits, bounded fallback, complete and partial lost tails,
 multiple surviving duplicates, final flush failure, planned volume caps, changed
 replays, read-ahead refill/start timing, position parsing and failure propagation,
-and format-2 restore/incremental-base compatibility. The large binary test writes
+and rejection of unsupported tape formats. The large binary test writes
 and restores 10 GiB while asserting that individual frames remain small.
 
-Validation completed: 77 automated tests passed, including the separate 10 GiB
-standalone backup/verify/restore round trip. The 18 continuous-stream
-tests also passed on the Python 3.11 build baseline. The rebuilt executable passed
-the Debian 11 smoke test without Python installed. Its SHA-256 checksum was checked.
+The README documents how to run the source and standalone suites, the optional
+10 GiB round trip, and the Debian 11 smoke test without Python installed. Format-3
+full and incremental tapes produced by the released v1.0.0 executable were also
+restored successfully with the simplified reader after removing older formats.
 
 Physical qualification: use scratch tapes on the target drive, verify a complete
 backup, and exercise end-of-medium rollover and restore. Observe `committed` moving

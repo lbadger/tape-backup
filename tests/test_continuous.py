@@ -1,11 +1,10 @@
-"""Continuous writes, delayed durability, and version-2 compatibility."""
+"""Continuous writes, delayed durability, and format validation."""
 from collections import defaultdict
 from contextlib import redirect_stderr
 import ctypes
 import errno
 import hashlib
 import io
-import json
 from pathlib import Path
 import struct
 import tempfile
@@ -229,44 +228,37 @@ class ContinuousTests(unittest.TestCase):
             self.assertLessEqual(progress.queued_bytes, 3)
         self.assertEqual(progress.queued_bytes, 0)
 
-    def test_format_2_tapes_restore_and_supply_incremental_snapshot(self):
-        media = tb.FileMedia(self.root / 'legacy')
-        job = {'id': 'a' * 32, 'level': 'full', 'parent': None,
-               'source': str(self.source), 'created': '2026-01-01T00:00:00+00:00'}
-        media.load(job['id'], 1, True)
-        hashes = {kind: hashlib.sha256() for kind in ('data', 'snapshot')}
-        lengths = dict.fromkeys(hashes, 0)
-        previous, sequence = tb.ZERO_CHAIN, 0
-        with media.path.open('wb') as out, tb.ram_snapshot() as snapshot_fd:
-            out.write(tb.encoded_header({'type': 'volume', 'format': 2, 'backup': job,
-                                        'volume': 1, 'sequence': 0, 'previous': previous}, tb.LEGACY_MAGIC))
+    def test_unsupported_header_prefixes_are_rejected(self):
+        media = BufferedMedia(self.root / 'media')
+        backup_id = tb.backup(self.source, media, quiet=True)
+        first = media.directory / f'{backup_id}.0001.tape'
+        original = first.read_bytes()
+        for magic in (b'TAPE-STREAM-1\n', b'TAPE-STREAM-2\n', b'TAPE-STREAM-4\n'):
+            with self.subTest(magic=magic):
+                first.write_bytes(magic + original[len(tb.MAGIC):])
+                for verify in (False, True):
+                    with self.assertRaisesRegex(tb.BackupError, 'Wrong tape format'):
+                        tb.scan(media, backup_id, verify=verify)
+                destination = self.root / 'unsupported-restore'
+                with self.assertRaisesRegex(tb.BackupError, 'Wrong tape format'):
+                    tb.restore([backup_id], destination, media, quiet=True)
+                self.assertFalse(destination.exists())
 
-            def frame(kind, data):
-                nonlocal previous, sequence
-                record = tb.encoded_header({'type': 'chunk', 'sequence': sequence, 'kind': kind,
-                                            'length': len(data), 'sha256': hashlib.sha256(data).hexdigest(),
-                                            'previous': previous}, tb.LEGACY_MAGIC)
-                out.write(record)
-                out.write(data)
-                out.write(bytes(-len(data) % tb.BLOCK_SIZE))
-                previous = hashlib.sha256(record).hexdigest()
-                sequence += 1
-
-            # Legacy data chunks are deliberately larger than the new frame limit.
-            for kind, payload in tb.archive_frames(self.source, snapshot_fd, 8 * 1024**2, True):
-                hashes[kind].update(payload)
-                lengths[kind] += len(payload)
-                frame(kind, payload)
-            frame('end', json.dumps({'data_bytes': lengths['data'], 'data_sha256': hashes['data'].hexdigest(),
-                                     'snapshot_bytes': lengths['snapshot'],
-                                     'snapshot_sha256': hashes['snapshot'].hexdigest(),
-                                     'chunks': sequence}).encode())
-        self.assertTrue(tb.scan(media, job['id'])['data_verified'])
-        (self.source / 'new').write_text('incremental across format versions')
-        delta = tb.backup(self.source, media, level='incremental', base=job['id'], quiet=True)
-        destination = self.root / 'restored'
-        tb.restore([job['id'], delta], destination, media, quiet=True)
-        self.assertEqual(tree_contents(self.source), tree_contents(destination))
+    def test_noncurrent_format_declarations_are_rejected_on_every_volume(self):
+        media = BufferedMedia(self.root / 'media')
+        backup_id = tb.backup(self.source, media, volume_size=1024**2, quiet=True)
+        for number in (1, 2):
+            volume = media.directory / f'{backup_id}.{number:04d}.tape'
+            original = volume.read_bytes()
+            for version in (1, 2, 4):
+                with self.subTest(volume=number, version=version):
+                    header = tb.decoded_header(original[:tb.BLOCK_SIZE])
+                    header['format'] = version
+                    volume.write_bytes(tb.encoded_header(header) + original[tb.BLOCK_SIZE:])
+                    for verify in (False, True):
+                        with self.assertRaisesRegex(tb.BackupError, 'only format 3 is supported'):
+                            tb.scan(media, backup_id, verify=verify)
+            volume.write_bytes(original)
 
 
 class PositionTests(unittest.TestCase):
@@ -321,7 +313,7 @@ class PositionTests(unittest.TestCase):
         stream = Mock()
         stream.read.return_value = b'x' * tb.BLOCK_SIZE
         with patch.object(tb.fcntl, 'ioctl') as ioctl:
-            tb.Volume(stream, physical=True).skip_payload(2 * tb.BLOCK_SIZE + 1, filemarks=False)
+            tb.Volume(stream, physical=True).skip_payload(2 * tb.BLOCK_SIZE + 1)
         ioctl.assert_not_called()
         self.assertEqual(stream.read.call_count, 3)
 

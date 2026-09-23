@@ -13,8 +13,7 @@ to select another non-rewinding tape drive.
 ## Download
 
 Version 1.0.0 implements continuous streaming with small frames, background
-read-ahead, and buffers up to 10 GiB. It writes tape format 3 and reads existing
-format-2 backups.
+read-ahead, and buffers up to 10 GiB. It writes tape format 3.
 
 Download the executable and checksum from the
 [v1.0.0 release](https://github.com/lbadger/tape-backup/releases/tag/v1.0.0):
@@ -85,11 +84,10 @@ file, then writes a new backup to fresh tapes:
 ```
 
 Load the previous backup's volumes in order when prompted, followed by fresh
-writable tapes for the new backup. Format-3 metadata scans read past archive
-records without keeping or hashing their payloads; there are no per-chunk
-filemarks to skip. Format-2 tapes still use filemark spacing. This can make loading
-a format-3 incremental base slower. No persistent snapshot/cache file is required.
-Metadata memory consumption grows with the number of filenames.
+writable tapes for the new backup. Metadata scans read past archive records
+without keeping or hashing their payloads. Traversing the preceding backup takes
+time. No persistent snapshot/cache file is required. Metadata memory consumption
+grows with the number of filenames.
 
 Each incremental is relative to the backup specified by `--base`. For a linear
 chain, pass the most recent successful backup ID. The source directory must match.
@@ -168,6 +166,19 @@ tar. It applies additions, changes, deletions, and renames from the ordered chai
 An empty or absent destination is required. Files are extracted into a private
 sibling directory and renamed into the destination only after the full chain and
 its completion markers have been verified.
+
+The tape contains format-3 framing around the tar data, so a direct
+`tar --extract --file=/dev/nst0` cannot restore it. If the standalone executable
+is unavailable, run this repository's `tape_backup.py` with Python 3.11+, GNU tar,
+and `mt` installed:
+
+```bash
+python3 tape_backup.py restore --backup FULL_ID DELTA_1_ID DELTA_2_ID \
+  --destination /srv/recovered --device /dev/nst0
+```
+
+For a full-only restore, pass just the full backup ID. Keep a copy of the source
+script or executable with your recovery tools.
 
 **Restore writes only the extracted files, not a reassembled tar archive.** Allow
 space for the largest intermediate directory tree in the chain, including files
@@ -257,8 +268,7 @@ snapshot metadata. Allow more than 2 GiB of RAM at the default, or more than 20 
 with a 10 GiB budget. Very small budgets still allow one active frame and one queued
 frame, and at least 128 KiB of recovery framing. Allocation grows on demand.
 The SSH source only needs small transport frames and its snapshot metadata.
-Format-3 restore holds a small frame plus a bounded history of header digests;
-legacy format-2 restore can still require RAM for large legacy chunks.
+Restore holds a small frame plus a bounded history of header digests.
 
 On a short write, end-of-tape indication, or write/position I/O error, the writer
 requests another tape and replays **every unconfirmed frame**, including the
@@ -274,11 +284,9 @@ the final synchronous commit. Missing frames, wrong tapes, checksum failures, an
 incomplete sets are rejected. Backup does not perform automatic read-back
 verification; use `verify` for a full read pass.
 
-New backups use **format 3** and require v1.0.0 for restore,
-inspect, verify, and incremental-base reading. Existing format-2 tapes from
-v0.2/v0.3 and earlier 0.4 development builds remain readable, including chunks up
-to 10 GiB. Incremental chains may cross from format 2 to format 3. Update both ends
-of SSH backups; the transport uses 64-bit version-2 packet framing.
+Backups use **format 3**, including restore, inspect, verify, and incremental-base
+reading. The current source supports this format exclusively. Update both ends
+of SSH backups together; the current transport uses 64-bit version-2 packet framing.
 
 See the [continuous-streaming design and validation plan](docs/continuous-streaming.md).
 
@@ -309,13 +317,11 @@ not a media-integrity check; its JSON output says `data_verified: false`. `verif
 reads all data without extracting files and reports `data_verified: true` only
 when it reaches and validates the completion marker.
 
-## Supported tape formats
+## Tape format
 
-Version 1.0.0 writes format 3 and reads both format 3 and format 2 streaming tapes
-created by v0.2, v0.3, and earlier 0.4 development builds. The legacy restore command
-and disk-staging implementation have been removed. To restore v0.1 tapes, build
-the [v0.1.0 source tag](https://github.com/lbadger/tape-backup/tree/v0.1.0) and use
-the original catalogs. Start a new full backup when migrating from v0.1.
+The current source reads and writes only format 3 (`TAPE-STREAM-3`). Full and
+incremental backups created by v1.0.0 use this format and remain readable.
+Other tape formats are rejected before their archive data is processed.
 
 ## Automated tape loading
 

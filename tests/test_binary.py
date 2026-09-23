@@ -155,9 +155,6 @@ class BinaryTests(unittest.TestCase):
         for name in ('keep', 'change', 'remove'):
             self.assertEqual((destination / name).read_bytes(), (self.source / name).read_bytes())
 
-    def test_legacy_restore_is_removed(self):
-        self.assertNotIn("legacy-restore", self.run_binary("--help"))
-        self.run_binary("legacy-restore", expected=2)
 
 
 if __name__ == "__main__":

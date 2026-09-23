@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Support only the current format-3 tapes. Remove format-2 header decoding,
+  large legacy chunks, single-chunk replay compatibility, and filemark-based
+  metadata skipping. Older formats are rejected by inspect, verify, restore,
+  and incremental-base loading. Current format-3 backups are unchanged.
+
 ## 1.0.0 — 2026-09-23
 
 Major update: continuous streaming replaces per-chunk tape flushes. New backups

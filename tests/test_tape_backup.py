@@ -424,15 +424,13 @@ class StreamingTests(unittest.TestCase):
             tb.Volume(stream).write(b'x'*tb.BLOCK_SIZE)
         self.assertEqual(error.exception.errno, errno.ENOSPC)
 
-    def test_tape_commit_uses_synchronous_filemark_and_skip_uses_fsf(self):
+    def test_tape_commit_uses_synchronous_filemark(self):
         stream = Mock()
         stream.fileno.return_value = 42
         volume = tb.Volume(stream, physical=True)
         with patch.object(tb.fcntl, 'ioctl') as ioctl:
             volume.commit()
             ioctl.assert_called_with(42, tb.MTIOCTOP, struct.pack('@hi', tb.MTWEOF, 1))
-            volume.skip_payload(128000)
-            ioctl.assert_called_with(42, tb.MTIOCTOP, struct.pack('@hi', tb.MTFSF, 1))
 
     def test_filemarks_are_crossed_only_between_frames(self):
         stream = Mock()
