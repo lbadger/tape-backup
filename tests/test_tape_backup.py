@@ -6,16 +6,30 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch, Mock
 
 import tape_backup as tb
-from test_legacy_v1 import tree_contents
+
+
+def tree_contents(root):
+    result = {}
+    for path in sorted(root.rglob("*")):
+        name = str(path.relative_to(root))
+        if path.is_symlink():
+            result[name] = ("link", os.readlink(path))
+        elif path.is_dir():
+            result[name] = ("dir", stat.S_IMODE(path.stat().st_mode))
+        else:
+            result[name] = ("file", path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+    return result
 
 
 class FaultMedia(tb.FileMedia):
@@ -105,18 +119,17 @@ class StreamingTests(unittest.TestCase):
 
     def test_full_backup_streams_and_restores_without_state_or_archive(self):
         self.seed()
-        actual_chunks = tb.read_chunks
+        actual_frames = tb.archive_frames
         counts = []
-        def observe(stream, size, progress=None):
-            for index, chunk in enumerate(actual_chunks(stream, size, progress)):
-                if progress:
+        def observe(*args):
+            for index, (kind, chunk) in enumerate(actual_frames(*args)):
+                if kind == "data":
                     counts.append(len(chunk))
                     if index:
                         self.assertGreater(sum(p.stat().st_size for p in self.media.directory.glob('*.tape')),
                                            tb.BLOCK_SIZE)
-                yield chunk
-        with patch.object(tb, 'read_chunks', side_effect=observe), \
-                patch.object(tb.legacy, 'atomic_json', side_effect=AssertionError('No disk state allowed')):
+                yield kind, chunk
+        with patch.object(tb, 'archive_frames', side_effect=observe):
             backup_id = self.create()
         self.assertGreater(len(counts), 2)
         self.assertLessEqual(max(counts), tb.BLOCK_SIZE)
@@ -325,10 +338,10 @@ class StreamingTests(unittest.TestCase):
         media = object.__new__(tb.TapeMedia)
         media.device = '/dev/nst1'
         with patch.object(Path, 'read_text', return_value='0x8000'), \
-                patch.object(tb.legacy.TapeMedia, 'mt') as mt:
+                patch.object(tb, 'run_command') as mt:
             media.mt('rewind')
-            self.assertEqual(mt.call_args_list[0].args, ('stclearoptions', '0xa000'))
-            self.assertEqual(mt.call_args_list[1].args, ('rewind',))
+            self.assertEqual(mt.call_args_list[0].args, (['mt', '-f', '/dev/nst1', 'stclearoptions', '0xa000'],))
+            self.assertEqual(mt.call_args_list[1].args, (['mt', '-f', '/dev/nst1', 'rewind'],))
 
     def test_eta_uses_payload_completion_and_reports_measured_rate(self):
         progress = tb.Progress('Test')
@@ -355,6 +368,29 @@ class StreamingTests(unittest.TestCase):
         self.assertFalse(hasattr(args, 'state'))
         with self.assertRaises(SystemExit):
             parser.parse_args(['backup', '--source', '/data', '--state', '/state'])
+
+    def test_concurrent_media_operation_is_rejected(self):
+        with self.media.lock(), self.assertRaisesRegex(tb.BackupError, 'Another operation'):
+            self.create()
+        self.assertFalse(list(self.media.directory.glob('*.tape')))
+
+    def test_tape_device_validation_and_selected_drive_loading(self):
+        for mode, device in ((stat.S_IFREG, 0), (stat.S_IFCHR, os.makedev(9, 1)),
+                             (stat.S_IFCHR, os.makedev(1, 128))):
+            info = SimpleNamespace(st_mode=mode, st_rdev=device)
+            with patch.object(tb.os, 'stat', return_value=info), self.assertRaises(tb.BackupError):
+                tb.TapeMedia('/dev/nst1')
+        info = SimpleNamespace(st_mode=stat.S_IFCHR, st_rdev=os.makedev(9, 129))
+        with patch.object(tb.os, 'stat', return_value=info), \
+                patch.object(tb.shutil, 'which', return_value='/usr/bin/mt'):
+            media = tb.TapeMedia('/dev/nst1', '/loader')
+        with patch.object(tb, 'run_command') as command, patch.object(Path, 'read_text', return_value='0x0'):
+            media.load('a'*32, 2, True)
+            media.release()
+        self.assertEqual([call.args[0] for call in command.call_args_list], [
+            ['/loader', 'write', 'a'*32, '2', '/dev/nst1'],
+            ['mt', '-f', '/dev/nst1', 'rewind'], ['mt', '-f', '/dev/nst1', 'setblk', '0'],
+            ['mt', '-f', '/dev/nst1', 'offline']])
 
 
 if __name__ == '__main__':

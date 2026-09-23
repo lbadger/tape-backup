@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.0
+
+- Add `backup --ssh USER@HOST` to stream a remote Linux source to a local tape
+  drive, including full and incremental backups, file names, rates, and ETA.
+- Use the same executable on the source, with RAM-only incremental snapshots and
+  a bounded, versioned SSH stream. No archive or persistent state is staged on
+  either machine. Restore requires no access to the original source.
+- Support SSH configuration/agents, explicit port/key/config options, and a
+  remote executable path. Verify host keys and use batch authentication.
+- Reject incomplete SSH streams and remote tar failures without a completion
+  marker. Bind incremental chains to the source path and SSH host/account.
+- Remove `legacy-restore`, the v0.1 implementation, and its build dependency.
+  Keep support for existing v0.2 streaming tapes.
+- Test real SSH full/delta restores, tape rollover/replay, disconnected streams,
+  remote errors, host-key rejection, and standalone executables at both ends.
+
+SSH sources need GNU tar and the same tape-backup version. Authentication uses
+keys or an agent. Interrupted SSH backups restart from the source on fresh tapes;
+the previous completed backup remains usable as an incremental base. Physical
+tape hardware remains untested.
+
 ## 0.2.0
 
 - Stream GNU tar directly from source to tape and from tape into restored files.

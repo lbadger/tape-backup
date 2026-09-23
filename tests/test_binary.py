@@ -54,7 +54,7 @@ class BinaryTests(unittest.TestCase):
         self.assertEqual(actual, expected)
 
     def test_relocated_binary_without_python_full_and_incremental_restore(self):
-        self.assertEqual(self.run_binary("--version"), "tape-backup 0.2.0")
+        self.assertEqual(self.run_binary("--version"), "tape-backup 0.3.0")
         self.assertIn("/dev/nst0", self.run_binary("backup", "--help"))
         full = self.run_binary(*self.backup_args)
         self.assertIn("./change", self.last_stderr)
@@ -113,14 +113,9 @@ class BinaryTests(unittest.TestCase):
         self.assertIn("MiB/s", self.last_stderr)
         self.assertIn("ETA", self.last_stderr)
 
-    def test_binary_still_restores_legacy_tapes(self):
-        import legacy_v1
-        catalog = legacy_v1.backup(self.root / "legacy-state", self.source, "full",
-                                   legacy_v1.FileMedia(self.media), 128 * 1024)
-        self.run_binary("legacy-restore", "--catalog", catalog, "--destination", self.root / "restored",
-                        "--work-dir", self.root / "legacy-work", "--media-dir", self.media)
-        self.assertEqual((self.root / "restored" / "keep").read_bytes(),
-                         (self.source / "keep").read_bytes())
+    def test_legacy_restore_is_removed(self):
+        self.assertNotIn("legacy-restore", self.run_binary("--help"))
+        self.run_binary("legacy-restore", expected=2)
 
 
 if __name__ == "__main__":

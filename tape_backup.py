@@ -2,7 +2,7 @@
 """Stream full and incremental GNU tar backups to self-contained tape sets."""
 
 import argparse
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 import errno
 import fcntl
@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import stat
 import struct
@@ -21,19 +22,22 @@ import threading
 import time
 import uuid
 
-import legacy_v1 as legacy
-
-BackupError = legacy.BackupError
 BLOCK_SIZE = 64 * 1024
 DEFAULT_BUFFER = 64 * 1024**2
 MAX_BUFFER = 256 * 1024**2
 MAGIC = b"TAPE-STREAM-2\n"
 ZERO_CHAIN = "0" * 64
-PROGRAM_VERSION = "0.2.0"
+PROGRAM_VERSION = "0.3.0"
 # Linux struct mtop: short operation, padding, int count (x86-64 / AArch64).
 MTIOCTOP = 0x40086D01
 MTFSF, MTWEOF = 1, 5
 RECOVERABLE = (errno.ENOSPC, errno.EIO)
+SSH_MAGIC = b"TAPE-SSH-1\n"
+PACKET_HEADER = struct.Struct("!cI")
+
+
+class BackupError(Exception):
+    """An actionable backup or restore failure."""
 
 
 def log(message):
@@ -50,6 +54,55 @@ def external_env():
         else:
             env["LD_LIBRARY_PATH"] = original
     return env
+
+
+def run_command(args):
+    result = subprocess.run(args, env=external_env(), stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+    if result.returncode:
+        raise BackupError(f"{args[0]} failed ({result.returncode}): "
+                          f"{result.stderr.strip() or result.stdout.strip()}")
+    if result.stderr.strip():
+        log(result.stderr.strip())
+    return result.stdout
+
+
+def require_tar():
+    if "GNU tar" not in run_command(["tar", "--version"]):
+        raise BackupError("GNU tar is required for incremental archives")
+
+
+def inside(path, parent):
+    return path == parent or parent in path.parents
+
+
+def empty_destination(destination):
+    if destination.is_symlink() or (destination.exists() and
+            (not destination.is_dir() or any(destination.iterdir()))):
+        raise BackupError("Restore destination must be absent or an empty directory")
+
+
+def fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def locked(directory):
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(directory / ".lock", "a") as stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise BackupError(f"Another operation is using {directory}") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(stream, fcntl.LOCK_UN)
 
 
 def valid_id(value):
@@ -69,8 +122,6 @@ def encoded_header(fields):
 
 
 def decoded_header(record):
-    if record.startswith(legacy.MAGIC):
-        raise BackupError("This is a v0.1 tape; use legacy-restore with its catalogs")
     if len(record) != BLOCK_SIZE or not record.startswith(MAGIC):
         raise BackupError("Wrong tape format or corrupt record header")
     try:
@@ -198,7 +249,11 @@ class Volume:
         self.stream.close()
 
 
-class FileMedia(legacy.FileMedia):
+class FileMedia:
+    def __init__(self, directory):
+        self.directory = Path(directory).resolve()
+        self.path = None
+
     def load(self, backup_id, number, writing):
         if backup_id is None:
             ids = sorted({p.name.split(".")[0] for p in self.directory.glob("*.0001.tape")})
@@ -206,7 +261,8 @@ class FileMedia(legacy.FileMedia):
                 raise BackupError("Specify --backup; available IDs: " + ", ".join(ids))
             backup_id = ids[0]
         valid_id(backup_id)
-        super().load({"id": backup_id}, number, writing)
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.path = self.directory / f"{backup_id}.{number:04d}.tape"
 
     def open(self, writing):
         try:
@@ -215,8 +271,31 @@ class FileMedia(legacy.FileMedia):
             raise BackupError(f"Incomplete backup: missing tape volume {self.path.name}") from exc
         return Volume(stream)
 
+    def release(self):
+        pass
 
-class TapeMedia(legacy.TapeMedia):
+    @contextmanager
+    def lock(self):
+        with locked(self.directory):
+            yield
+
+
+class TapeMedia:
+    def __init__(self, device="/dev/nst0", media_command=None):
+        self.device = str(Path(device).resolve())
+        self.media_command = media_command
+        try:
+            info = os.stat(self.device)
+        except OSError as exc:
+            raise BackupError(f"Cannot access tape device {self.device}: {exc}") from exc
+        if not stat.S_ISCHR(info.st_mode):
+            raise BackupError("--device must be a Linux SCSI tape character device")
+        if os.major(info.st_rdev) != 9 or not (os.minor(info.st_rdev) & 128):
+            raise BackupError("Use a non-rewinding Linux SCSI tape device, e.g. /dev/nst0")
+        if not shutil.which("mt"):
+            raise BackupError("The mt command is required (install the mt-st package)")
+        self.device_number = info.st_rdev
+
     def mt(self, *args):
         if args == ("rewind",):
             # MTWEOF itself honors the driver's NOWAIT_EOF setting. Disabling
@@ -227,19 +306,40 @@ class TapeMedia(legacy.TapeMedia):
             except (OSError, ValueError):
                 synchronous = False
             if not synchronous:
-                super().mt("stclearoptions", "0xa000")
-        super().mt(*args)
+                run_command(["mt", "-f", self.device, "stclearoptions", "0xa000"])
+        run_command(["mt", "-f", self.device, *args])
 
     def load(self, backup_id, number, writing):
-        try:
-            super().load({"id": backup_id or "unknown-backup"}, number, writing)
-        except BackupError as exc:
-            if "cancelled" in str(exc):
-                raise BackupError("Media change cancelled; the streaming operation is incomplete") from exc
-            raise
+        backup_id = backup_id or "unknown-backup"
+        action = "write" if writing else "read"
+        if self.media_command:
+            run_command([self.media_command, action, backup_id, str(number), self.device])
+        else:
+            warning = " (CONTENTS WILL BE OVERWRITTEN)" if writing else ""
+            try:
+                with open("/dev/tty", "r+") as tty:
+                    tty.write(f"Load {backup_id} volume {number} into {self.device} for {action}{warning}.\n"
+                              "Press Enter when ready, or type q to stop: ")
+                    tty.flush()
+                    response = tty.readline()
+            except OSError as exc:
+                raise BackupError("No terminal for tape changes; use --media-command") from exc
+            if not response or response.strip().lower() == "q":
+                raise BackupError("Media change cancelled; the streaming operation is incomplete")
+        self.mt("rewind")
+        self.mt("setblk", "0")
 
     def open(self, writing):
         return Volume(open(self.device, "wb" if writing else "rb", buffering=0), physical=True)
+
+    def release(self):
+        self.mt("offline")
+
+    @contextmanager
+    def lock(self):
+        directory = Path.home() / ".cache" / "tape-backup" / str(self.device_number)
+        with locked(directory):
+            yield
 
 
 class StreamWriter:
@@ -528,13 +628,185 @@ def estimate_source(source, parent_created=None):
     return ((total + 10239) // 10240) * 10240
 
 
-def backup(source, media, *, level="full", base=None, volume_size=None,
-           buffer_size=DEFAULT_BUFFER, quiet=False):
-    source = Path(source).resolve()
+def archive_frames(source, snapshot_fd, buffer_size, quiet):
+    """Produce tar and its updated RAM snapshot, locally or on the SSH source."""
+    args = ["tar", "--create", "--format=posix", "--acls", "--xattrs", "--sparse",
+            "--numeric-owner", f"--listed-incremental=/proc/self/fd/{snapshot_fd}",
+            "--file=-", f"--directory={source}", *([] if quiet else ["--verbose"]), "--", "."]
+    process = subprocess.Popen(args, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                               env=external_env(), pass_fds=(snapshot_fd,))
+    try:
+        for chunk in read_chunks(process.stdout, buffer_size):
+            yield "data", chunk
+        if process.wait():
+            raise BackupError("GNU tar failed; this tape set has no completion marker and must be restarted")
+        os.lseek(snapshot_fd, 0, os.SEEK_SET)
+        with os.fdopen(os.dup(snapshot_fd), "rb", buffering=0) as snapshot:
+            for chunk in read_chunks(snapshot, buffer_size):
+                yield "snapshot", chunk
+    finally:
+        stop_process(process)
+
+
+def read_exact(stream, size):
+    result = bytearray()
+    while len(result) < size:
+        block = stream.read(min(1024**2, size - len(result)))
+        if not block:
+            raise BackupError("SSH source disconnected or returned an incomplete stream; "
+                              "check the SSH errors above and the remote binary version")
+        result.extend(block)
+    return result
+
+
+def send_packet(stream, kind, payload=b""):
+    stream.write(PACKET_HEADER.pack(kind, len(payload)))
+    stream.write(payload)
+    stream.flush()
+
+
+def receive_packet(stream, limit):
+    kind, size = PACKET_HEADER.unpack(read_exact(stream, PACKET_HEADER.size))
+    if size > limit:
+        raise BackupError("SSH source packet exceeds the negotiated buffer size")
+    return kind, read_exact(stream, size)
+
+
+def receive_json(stream):
+    kind, payload = receive_packet(stream, BLOCK_SIZE)
+    try:
+        fields = json.loads(payload)
+        if kind != b"j" or not isinstance(fields, dict):
+            raise ValueError("expected a metadata object")
+        return fields
+    except (ValueError, TypeError) as exc:
+        raise BackupError(f"Invalid SSH source metadata: {exc}") from exc
+
+
+class SSHConfig:
+    def __init__(self, host, *, port=None, identity=None, config=None, program="tape-backup"):
+        if not host or host.startswith("-") or any(c.isspace() or ord(c) < 32 for c in host):
+            raise BackupError("--ssh must be a host alias or user@host")
+        if port is not None and not 1 <= port <= 65535:
+            raise BackupError("--ssh-port must be between 1 and 65535")
+        if not program or "\0" in program:
+            raise BackupError("--remote-program must name the executable on the source machine")
+        self.host, self.port = host, port
+        self.identity, self.config, self.program = identity, config, program
+
+    @property
+    def metadata(self):
+        return {"host": self.host, "port": self.port}
+
+    def command(self):
+        # SSH invokes a remote shell, so quote the executable as one shell word.
+        # Source paths travel as JSON over stdin, never in a shell command.
+        args = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+                "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3"]
+        for flag, value in (("-p", self.port), ("-i", self.identity), ("-F", self.config)):
+            if value is not None:
+                args.extend((flag, str(value)))
+        return [*args, "--", self.host, shlex.join([self.program, "_ssh-source"])]
+
+
+class RemoteSource:
+    def __init__(self, config, source, snapshot_fd, parent_created, buffer_size, quiet):
+        self.config, self.source, self.snapshot_fd = config, source, snapshot_fd
+        self.parent_created, self.buffer_size, self.quiet = parent_created, buffer_size, quiet
+        self.process = None
+
+    def prepare(self):
+        log(f"Connecting to SSH source {self.config.host}")
+        self.process = subprocess.Popen(self.config.command(), stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, env=external_env())
+        process = self.process
+        if read_exact(process.stdout, len(SSH_MAGIC)) != SSH_MAGIC:
+            raise BackupError("Unsupported SSH source protocol; install the same tape-backup version "
+                              "on the source and keep remote shell startup output off stdout")
+        request = {"source": str(self.source), "parent_created": self.parent_created,
+                   "buffer_size": self.buffer_size, "quiet": self.quiet}
+        send_packet(process.stdin, b"j", json.dumps(request).encode())
+        os.lseek(self.snapshot_fd, 0, os.SEEK_SET)
+        with os.fdopen(os.dup(self.snapshot_fd), "rb", buffering=0) as snapshot:
+            for chunk in read_chunks(snapshot, BLOCK_SIZE):
+                send_packet(process.stdin, b"s", chunk)
+        send_packet(process.stdin, b"e")
+        with Progress("SSH source inventory", transfer=False) as progress:
+            progress.phase = f"waiting for metadata from {self.config.host}"
+            metadata = receive_json(process.stdout)
+        if (not isinstance(metadata.get("source"), str) or not Path(metadata["source"]).is_absolute() or
+                type(metadata.get("estimated_bytes")) is not int or metadata["estimated_bytes"] <= 0):
+            raise BackupError("Invalid SSH source path or size estimate")
+        return metadata
+
+    def frames(self):
+        send_packet(self.process.stdin, b"g")  # Start only after the first tape is loaded.
+        self.process.stdin.close()
+        phase = b"d"
+        while True:
+            kind, payload = receive_packet(self.process.stdout, self.buffer_size)
+            if kind == b"e" and not payload:
+                break
+            if kind not in (b"d", b"s") or not payload or (phase == b"s" and kind == b"d"):
+                raise BackupError("Invalid or out-of-order SSH archive packet")
+            phase = kind
+            yield "data" if kind == b"d" else "snapshot", payload
+        if self.process.stdout.read(1) or self.process.wait():
+            raise BackupError("SSH source failed after streaming; this tape set is incomplete")
+
+    def close(self):
+        stop_process(self.process)
+
+
+def serve_ssh_source():
+    """Private versioned protocol; only archive bytes/metadata go to stdout."""
+    incoming, outgoing = sys.stdin.buffer, sys.stdout.buffer
+    outgoing.write(SSH_MAGIC)
+    outgoing.flush()
+    request = receive_json(incoming)
+    try:
+        source = Path(request["source"])
+        buffer_size, quiet = request["buffer_size"], request["quiet"]
+        parent_created = request["parent_created"]
+        if (not source.is_absolute() or type(buffer_size) is not int or
+                not BLOCK_SIZE <= buffer_size <= MAX_BUFFER or type(quiet) is not bool):
+            raise ValueError("expected an absolute source path and a valid buffer size")
+        if parent_created is not None:
+            datetime.fromisoformat(parent_created)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BackupError(f"Invalid SSH source request: {exc}") from exc
+    source = source.resolve()
     if not source.is_dir():
         raise BackupError(f"Source is not a directory: {source}")
-    if isinstance(media, FileMedia) and (legacy.inside(media.directory, source) or
-                                        legacy.inside(source, media.directory)):
+    require_tar()
+    with ram_snapshot() as snapshot_fd:
+        with os.fdopen(os.dup(snapshot_fd), "wb", buffering=0) as snapshot:
+            while True:
+                kind, payload = receive_packet(incoming, BLOCK_SIZE)
+                if kind == b"e" and not payload:
+                    break
+                if kind != b"s" or not payload:
+                    raise BackupError("Invalid SSH incremental snapshot packet")
+                snapshot.write(payload)
+        metadata = {"source": str(source), "estimated_bytes": estimate_source(source, parent_created)}
+        send_packet(outgoing, b"j", json.dumps(metadata).encode())
+        if receive_packet(incoming, 0) != (b"g", b""):
+            raise BackupError("Missing SSH source start request")
+        with closing(archive_frames(source, snapshot_fd, buffer_size, quiet)) as frames:
+            for kind, payload in frames:
+                send_packet(outgoing, b"d" if kind == "data" else b"s", payload)
+        send_packet(outgoing, b"e")
+
+
+def backup(source, media, *, level="full", base=None, volume_size=None,
+           buffer_size=DEFAULT_BUFFER, quiet=False, ssh=None):
+    source = Path(source) if ssh else Path(source).resolve()
+    if ssh and not source.is_absolute():
+        raise BackupError("SSH --source must be an absolute path on the remote machine")
+    if not ssh and not source.is_dir():
+        raise BackupError(f"Source is not a directory: {source}")
+    if not ssh and isinstance(media, FileMedia) and (inside(media.directory, source) or
+                                                    inside(source, media.directory)):
         raise BackupError("Source and media directories must be separate")
     if level not in ("full", "incremental") or (level == "incremental") != bool(base):
         raise BackupError("Incremental backup requires --base ID; full backup must not use --base")
@@ -544,66 +816,80 @@ def backup(source, media, *, level="full", base=None, volume_size=None,
         if volume_size < 4 * BLOCK_SIZE:
             raise BackupError("Volume size must be at least 256KiB")
         buffer_size = min(buffer_size, (volume_size // BLOCK_SIZE - 2) * BLOCK_SIZE)
-    legacy.require_tar()
+    if not ssh:
+        require_tar()
     with media.lock(), ram_snapshot() as snapshot_fd:
+        parent = None
         parent_created = None
         if base:
             valid_id(base)
             log(f"Loading the incremental snapshot from backup {base}")
             parent = scan(media, base, snapshot_fd, verify=False)
-            if parent["source"] != str(source):
-                raise BackupError("Incremental source differs from the parent backup")
+            if parent.get("ssh") != (ssh.metadata if ssh else None):
+                raise BackupError("Incremental SSH source differs from the parent backup")
             parent_created = parent["created"]
             media.release()
-        log("Estimating archive size from file metadata; file contents are not staged")
-        estimated_bytes = estimate_source(source, parent_created)
-        job = {"id": uuid.uuid4().hex, "level": level, "parent": base, "source": str(source),
-               "created": datetime.now(timezone.utc).isoformat(), "estimated_bytes": estimated_bytes}
-        process = None
-        log(f"Streaming {level} backup {job['id']} from {source}; "
-            f"buffer {buffer_size / 1024**2:g} MiB; no disk archive or state directory")
-        with Progress(job["id"]) as progress:
-            progress.estimate(estimated_bytes)
-            writer = StreamWriter(media, job, volume_size, progress)
-            try:
-                writer.next_volume()  # Load the tape before starting the source scan.
-                args = ["tar", "--create", "--format=posix", "--acls", "--xattrs", "--sparse",
-                        "--numeric-owner", f"--listed-incremental=/proc/self/fd/{snapshot_fd}",
-                        "--file=-", f"--directory={source}", *( [] if quiet else ["--verbose"]), "--", "."]
-                process = subprocess.Popen(args, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                                           env=external_env(), pass_fds=(snapshot_fd,))
-                data_hash = hashlib.sha256()
-                for chunk in read_chunks(process.stdout, buffer_size, progress):
-                    writer.send("data", chunk)
-                    data_hash.update(chunk)
-                if process.wait():
-                    raise BackupError("GNU tar failed; this tape set has no completion marker and must be restarted")
-                progress.phase = "writing incremental snapshot to tape"
-                os.lseek(snapshot_fd, 0, os.SEEK_SET)
-                snapshot_hash, snapshot_bytes = hashlib.sha256(), 0
-                with os.fdopen(os.dup(snapshot_fd), "rb", buffering=0) as snapshot:
-                    for chunk in read_chunks(snapshot, buffer_size):
-                        writer.send("snapshot", chunk)
+        remote = RemoteSource(ssh, source, snapshot_fd, parent_created, buffer_size, quiet) if ssh else None
+        try:
+            if remote:
+                metadata = remote.prepare()
+                source, estimated_bytes = metadata["source"], metadata["estimated_bytes"]
+            else:
+                log("Estimating archive size from file metadata; file contents are not staged")
+                estimated_bytes = estimate_source(source, parent_created)
+            if parent and parent["source"] != str(source):
+                raise BackupError("Incremental source differs from the parent backup")
+            return write_backup(source, media, level, base, volume_size, buffer_size, quiet,
+                                snapshot_fd, estimated_bytes, remote)
+        finally:
+            if remote:
+                remote.close()
+
+
+def write_backup(source, media, level, base, volume_size, buffer_size, quiet,
+                 snapshot_fd, estimated_bytes, remote):
+    job = {"id": uuid.uuid4().hex, "level": level, "parent": base, "source": str(source),
+           "created": datetime.now(timezone.utc).isoformat(), "estimated_bytes": estimated_bytes}
+    if remote:
+        job["ssh"] = remote.config.metadata
+    label = f"{remote.config.host}:{source}" if remote else source
+    log(f"Streaming {level} backup {job['id']} from {label}; "
+        f"buffer {buffer_size / 1024**2:g} MiB; no disk archive or state directory")
+    with Progress(job["id"]) as progress:
+        progress.estimate(estimated_bytes)
+        writer = StreamWriter(media, job, volume_size, progress)
+        try:
+            writer.next_volume()  # Load the tape before starting the source scan.
+            data_hash = hashlib.sha256()
+            snapshot_hash, snapshot_bytes = hashlib.sha256(), 0
+            frames = remote.frames() if remote else archive_frames(source, snapshot_fd, buffer_size, quiet)
+            with closing(frames):
+                for kind, chunk in frames:
+                    if kind == "data":
+                        progress.read_bytes += len(chunk)
+                        data_hash.update(chunk)
+                    else:
+                        progress.phase = "writing incremental snapshot to tape"
                         snapshot_hash.update(chunk)
                         snapshot_bytes += len(chunk)
-                if not snapshot_bytes:
-                    raise BackupError("GNU tar did not create its incremental snapshot")
-                end = {"data_bytes": progress.read_bytes, "data_sha256": data_hash.hexdigest(),
-                       "snapshot_bytes": snapshot_bytes, "snapshot_sha256": snapshot_hash.hexdigest(),
-                       "chunks": writer.sequence}
-                writer.send("end", json.dumps(end, sort_keys=True).encode())
-                writer.close()
-                media.release()
-                progress.phase = "complete"
-                log(f"Completed {job['id']}: {progress.read_bytes} archive bytes, {writer.number} volume(s)")
-                return job["id"]
-            finally:
-                stop_process(process)
-                writer.close(ignore_errors=True)
+                    writer.send(kind, chunk)
+            if not snapshot_bytes or not progress.read_bytes:
+                raise BackupError("Source did not produce an archive and incremental snapshot")
+            end = {"data_bytes": progress.read_bytes, "data_sha256": data_hash.hexdigest(),
+                   "snapshot_bytes": snapshot_bytes, "snapshot_sha256": snapshot_hash.hexdigest(),
+                   "chunks": writer.sequence}
+            writer.send("end", json.dumps(end, sort_keys=True).encode())
+            writer.close()
+            media.release()
+            progress.phase = "complete"
+            log(f"Completed {job['id']}: {progress.read_bytes} archive bytes, {writer.number} volume(s)")
+            return job["id"]
+        finally:
+            writer.close(ignore_errors=True)
 
 
 def restore(backup_ids, destination, media, *, quiet=False):
-    legacy.require_tar()
+    require_tar()
     if not backup_ids:
         raise BackupError("Specify the full backup ID followed by all incremental IDs")
     for backup_id in backup_ids:
@@ -612,9 +898,9 @@ def restore(backup_ids, destination, media, *, quiet=False):
         raise BackupError("Duplicate backup ID in restore chain")
     requested = Path(destination).absolute()
     destination = requested.parent.resolve() / requested.name
-    legacy.empty_destination(destination)
-    if isinstance(media, FileMedia) and (legacy.inside(media.directory, destination) or
-                                        legacy.inside(destination, media.directory)):
+    empty_destination(destination)
+    if isinstance(media, FileMedia) and (inside(media.directory, destination) or
+                                        inside(destination, media.directory)):
         raise BackupError("Restore destination and media must be separate")
     destination.parent.mkdir(parents=True, exist_ok=True)
     # Only restored files occupy disk. No intermediate archive or restore journal.
@@ -632,7 +918,7 @@ def restore(backup_ids, destination, media, *, quiet=False):
                         if job["level"] != "full" or job["parent"] is not None:
                             raise BackupError("Restore chain must start with a full backup")
                     elif (job["level"] != "incremental" or job["parent"] != parent["id"] or
-                          job["source"] != parent["source"]):
+                          job["source"] != parent["source"] or job.get("ssh") != parent.get("ssh")):
                         raise BackupError("Missing parent or out-of-order incremental backup")
                     log(f"Restoring {backup_id} ({job['level']}) directly from tape")
                     progress.phase = f"extracting {backup_id}"
@@ -656,9 +942,9 @@ def restore(backup_ids, destination, media, *, quiet=False):
                 media.release()
             progress.phase = "flushing restored files"
             os.sync()
-            legacy.empty_destination(destination)
+            empty_destination(destination)
             os.replace(tree, destination)
-            legacy.fsync_dir(destination.parent)
+            fsync_dir(destination.parent)
             progress.phase = "complete"
         return destination
     finally:
@@ -690,6 +976,11 @@ def make_parser():
 
     create = commands.add_parser("backup", help="Stream source files directly to tape")
     create.add_argument("--source", required=True, type=Path)
+    create.add_argument("--ssh", metavar="USER@HOST", help="Read source on a remote Linux machine over SSH")
+    create.add_argument("--ssh-port", type=int, help="SSH port (otherwise use SSH config)")
+    create.add_argument("--ssh-identity", type=Path, help="SSH private key (otherwise use SSH config/agent)")
+    create.add_argument("--ssh-config", type=Path, help="Use an alternative OpenSSH configuration file")
+    create.add_argument("--remote-program", help="Remote executable path (default: tape-backup in PATH)")
     create.add_argument("--level", choices=("full", "incremental"), default="full")
     create.add_argument("--base", help="Previous backup ID, required for incremental backups; load its tapes first")
     create.add_argument("--buffer-size", type=parse_size, default=DEFAULT_BUFFER, help="RAM retry buffer (default: 64MiB)")
@@ -705,29 +996,32 @@ def make_parser():
         command = commands.add_parser(name, help="Read metadata from tapes" if name == "inspect" else "Verify all tape data")
         command.add_argument("--backup", help="Backup ID; can be discovered from the first tape")
         media_options(command)
-    old = commands.add_parser("legacy-restore", help="Restore v0.1 tapes using their external catalogs")
-    old.add_argument("--catalog", nargs="+", required=True, type=Path)
-    old.add_argument("--destination", required=True, type=Path)
-    old.add_argument("--work-dir", required=True, type=Path)
-    media_options(old)
     return parser
 
 
 def main(argv=None):
-    args = make_parser().parse_args(argv)
+    argv = sys.argv[1:] if argv is None else argv
     os.umask(0o077)
     try:
+        if argv == ["_ssh-source"]:
+            serve_ssh_source()
+            return 0
+        args = make_parser().parse_args(argv)
+        ssh = None
+        if args.command == "backup":
+            if args.ssh:
+                ssh = SSHConfig(args.ssh, port=args.ssh_port, identity=args.ssh_identity,
+                                config=args.ssh_config, program=args.remote_program or "tape-backup")
+            elif any(value is not None for value in
+                     (args.ssh_port, args.ssh_identity, args.ssh_config, args.remote_program)):
+                raise BackupError("SSH options require --ssh USER@HOST")
         if args.media_dir and args.media_command:
             raise BackupError("--media-command only applies to physical tapes")
-        if args.command == "legacy-restore":
-            media = legacy.FileMedia(args.media_dir) if args.media_dir else legacy.TapeMedia(args.device, args.media_command)
-            print(legacy.restore(args.catalog, args.destination, args.work_dir, media))
-            return 0
         media = FileMedia(args.media_dir) if args.media_dir else TapeMedia(args.device, args.media_command)
         if args.command == "backup":
             size = args.volume_size or (1024**3 if args.media_dir else None)
             result = backup(args.source, media, level=args.level, base=args.base,
-                            volume_size=size, buffer_size=args.buffer_size, quiet=args.quiet)
+                            volume_size=size, buffer_size=args.buffer_size, quiet=args.quiet, ssh=ssh)
         elif args.command == "restore":
             result = restore(args.backup, args.destination, media, quiet=args.quiet)
         else:

@@ -2,4 +2,3 @@
 !Dockerfile.binary
 !requirements-build.txt
 !tape_backup.py
-!legacy_v1.py

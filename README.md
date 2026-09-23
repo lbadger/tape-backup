@@ -1,7 +1,7 @@
 # Tape backup and restore
 
 `tape-backup` streams full and incremental GNU tar archives directly between a
-source directory and a Linux tape drive. Version 0.2 requires **no `--state`
+local or remote Linux source directory and a Linux tape drive. It requires **no `--state`
 directory, no disk copy of the archive, and no external restore catalog**.
 Checksums, backup-chain identifiers, completion information, and the incremental
 snapshot are carried on the tapes.
@@ -13,11 +13,11 @@ to select another non-rewinding tape drive.
 ## Download
 
 Download the executable and checksum from the
-[v0.2.0 release](https://github.com/lbadger/tape-backup/releases/tag/v0.2.0):
+[v0.3.0 release](https://github.com/lbadger/tape-backup/releases/tag/v0.3.0):
 
 ```bash
-curl -fLO https://github.com/lbadger/tape-backup/releases/download/v0.2.0/tape-backup
-curl -fLO https://github.com/lbadger/tape-backup/releases/download/v0.2.0/tape-backup.sha256
+curl -fLO https://github.com/lbadger/tape-backup/releases/download/v0.3.0/tape-backup
+curl -fLO https://github.com/lbadger/tape-backup/releases/download/v0.3.0/tape-backup.sha256
 sha256sum --check tape-backup.sha256
 chmod +x tape-backup
 ./tape-backup --version
@@ -27,7 +27,7 @@ The supplied binary is Linux x86-64, built against glibc 2.31. It embeds Python;
 Python and Docker are not required at runtime. Install GNU tar and `mt` from
 `mt-st` (`sudo apt install tar mt-st` on Debian/Ubuntu). Normal Linux runtime
 libraries, including glibc and zlib, are required. Alpine/musl needs a separate
-build. Running the source requires Python 3.11+ and the adjacent `legacy_v1.py`.
+build. Running the source script requires Python 3.11+.
 
 Use a Linux SCSI tape drive supporting variable-length 64 KiB records. The user
 must have permission to operate the device. The script disables immediate rewind
@@ -90,6 +90,58 @@ chain, pass the most recent successful backup ID. The source directory must matc
 All ancestors, beginning with a full backup, are needed for restore. A new full
 backup starts an independent chain. An incomplete tape set cannot be used as a
 base.
+
+## Back up a remote source over SSH
+
+Run the command on the **machine with the tape drive**. Install the same version
+of `tape-backup` on the source machine, together with GNU tar. Both machines must
+run Linux; use a binary built for each machine's architecture. Neither machine
+needs Python when using the standalone binary. The tape host also needs the
+OpenSSH client; the source must accept SSH connections.
+
+For example, copy the binary to the source account's home directory:
+
+```bash
+scp ./tape-backup backup@fileserver:/home/backup/tape-backup
+ssh backup@fileserver 'chmod +x /home/backup/tape-backup'
+
+./tape-backup backup --ssh backup@fileserver \
+  --remote-program /home/backup/tape-backup \
+  --source /srv/data --level full --device /dev/nst0
+
+./tape-backup backup --ssh backup@fileserver \
+  --remote-program /home/backup/tape-backup \
+  --source /srv/data --level incremental --base PREVIOUS_BACKUP_ID \
+  --device /dev/nst0
+```
+
+If `tape-backup` is in the remote account's PATH, omit `--remote-program`. This
+option is one executable path, not a shell command. `--source` must be an absolute
+path on the remote machine. The SSH account must be able to read all source files
+and metadata; the tool does not run sudo automatically.
+
+Use SSH keys or an agent and establish the server's trusted host key before
+starting. Backups use batch authentication and strict host-key checking, so an
+unknown host or a password prompt fails before tape writing starts. Existing
+OpenSSH configuration, including host aliases and jump hosts, is honored. Options
+`--ssh-port 2222`, `--ssh-identity /path/to/key`, and `--ssh-config /path/to/config`
+override connection settings. Keep the same `--ssh` host/account or alias and
+`--ssh-port` setting throughout an incremental chain; the resolved source path
+must also match.
+
+The remote helper inventories metadata for ETA, runs GNU tar, and streams archive
+chunks over SSH to the local tape writer. Previous and updated incremental
+snapshots stay in RAM on both machines. No archive or state directory is staged
+on either machine. Tape changes pause the stream through pipe backpressure;
+memory use remains bounded by buffers and snapshot metadata rather than archive
+size. Remote file names, errors, transfer rates, and ETA appear in the local
+terminal. SSH transport encrypts the network connection; tapes are not encrypted
+by this tool.
+
+An SSH disconnection or remote tar failure leaves an incomplete tape set that
+cannot be used for restore or as an incremental base. Restart on fresh tapes,
+using the previous completed backup as the base. Restore uses the usual local
+`restore` command below and requires no SSH access or original source machine.
 
 ## Restore directly from tape
 
@@ -195,21 +247,12 @@ not a media-integrity check; its JSON output says `data_verified: false`. `verif
 reads all data without extracting files and reports `data_verified: true` only
 when it reaches and validates the completion marker.
 
-## Existing v0.1 backups
+## Supported tape formats
 
-The streaming format and CLI replace v0.1's disk-staged design. Start a new full
-backup when migrating; a v0.1 snapshot cannot serve as a streaming incremental
-base. Previously completed v0.1 sets remain restorable with their original
-catalogs and the compatibility command:
-
-```bash
-./tape-backup legacy-restore --catalog full.json delta.json \
-  --destination /srv/old-backup --work-dir /srv/legacy-work --device /dev/nst0
-```
-
-This compatibility path retains v0.1's archive staging and disk-space requirements.
-Keep old catalogs for old tapes. Unfinished v0.1 staging is not converted into a
-streaming backup. Stop the old process before starting the new executable.
+This release reads streaming tapes created by v0.2 and v0.3. The legacy restore
+command and disk-staging implementation have been removed. To restore v0.1 tapes,
+use the [v0.1.0 release](https://github.com/lbadger/tape-backup/releases/tag/v0.1.0)
+with their original catalogs. Start a new full backup when migrating from v0.1.
 
 ## Automated tape loading
 
@@ -242,7 +285,8 @@ full_id=$(./tape-backup backup --source ./sample-data --media-dir ./demo-tapes \
 # the venv module, and binutils. The result inherits host library requirements.
 ./build.sh --local
 
-# Test source code, legacy compatibility, and the built executable.
+# Test source code, SSH, and the built executable.
+# SSH integration tests need ssh, ssh-keygen, and sshd (openssh-client/server).
 TAPE_BACKUP_BINARY="$PWD/dist/tape-backup" python3 -m unittest discover -s tests -v
 
 # Test in Debian 11 without Python installed.
@@ -259,8 +303,11 @@ the interpreter for `--local` builds. PyInstaller is isolated in `.venv-build`.
 Tests cover streaming full and multiple incremental restores, no disk staging,
 metadata, ETA/rates, end-of-medium rollover, short writes, synchronous flush
 failures, lost buffered tails, duplicate replay, corruption, incomplete tapes,
-chain validation, and legacy compatibility. Physical tape hardware has not been
-exercised: qualify your drive and loader with scratch media before relying on it.
+chain validation, SSH full/delta restores, host-key verification, remote failures,
+connection loss, and standalone binaries at both ends. SSH tests launch a
+temporary loopback server with isolated keys/configuration. Physical tape hardware
+has not been exercised: qualify your drive and loader with scratch media before
+relying on it.
 
 The format uses 64 KiB records with checksummed headers; each volume header and
 each chunk is a separate tape file. Archive payloads are GNU incremental tar
