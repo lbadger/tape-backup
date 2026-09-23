@@ -1,0 +1,14 @@
+# Debian 11's glibc 2.31 gives this build a broader baseline than the host OS.
+FROM python:3.11-slim-bullseye AS builder
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends binutils \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY requirements-build.txt ./
+RUN python -m pip install --no-cache-dir -r requirements-build.txt
+COPY tape_backup.py ./
+RUN python -m PyInstaller --noconfirm --clean --onefile --noupx \
+    --name tape-backup tape_backup.py
+
+FROM scratch AS binary
+COPY --from=builder /build/dist/tape-backup /tape-backup

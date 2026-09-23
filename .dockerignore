@@ -1,0 +1,4 @@
+**
+!Dockerfile.binary
+!requirements-build.txt
+!tape_backup.py
