@@ -1,556 +1,361 @@
-"""Integration tests use real GNU tar and record-oriented fault-injected media."""
-
-from contextlib import contextmanager, redirect_stderr
+"""Streaming format tests with real GNU tar and injected tape failures."""
+from contextlib import redirect_stderr
 import errno
 import io
+import json
 import os
 from pathlib import Path
 import shutil
-import stat
+import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
-from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 import tape_backup as tb
+from test_legacy_v1 import tree_contents
 
 
 class FaultMedia(tb.FileMedia):
-    def __init__(self, directory, *, capacity=None, short=False, fail_volume=None,
-                 close_loss=0, close_error=False, corrupt=False):
+    def __init__(self, directory, *, capacity=None, short=False, fail_write=False,
+                 fail_commit=False, lost_records=0):
         super().__init__(directory)
-        self.capacity = capacity
-        self.short = short
-        self.fail_volume = fail_volume
-        self.close_loss = close_loss
-        self.close_error = close_error
-        self.corrupt = corrupt
+        self.capacity, self.short = capacity, short
+        self.fail_write, self.fail_commit = fail_write, fail_commit
+        self.lost_records = lost_records
         self.loads = []
 
-    def load(self, job, number, writing):
-        super().load(job, number, writing)
+    def load(self, backup_id, number, writing):
+        super().load(backup_id, number, writing)
         self.number = number
-        self.loads.append((job["id"], number, writing))
+        self.loads.append((backup_id, number, writing))
 
-    @contextmanager
-    def writer(self):
+    def open(self, writing):
+        volume = super().open(writing)
+        if not writing:
+            return volume
         owner = self
-        with super().writer() as stream:
-            class Writer:
-                def write(self, data):
-                    if owner.fail_volume == owner.number and stream.tell() >= tb.BLOCK_SIZE:
-                        raise OSError(errno.EIO, "Injected drive failure")
-                    if owner.capacity is not None and stream.tell() + len(data) > owner.capacity:
-                        left = max(0, owner.capacity - stream.tell())
-                        if left:
-                            stream.write(data[:left])
-                        if owner.short:
-                            return left
-                        raise OSError(errno.ENOSPC, "Injected end of tape")
-                    return stream.write(data)
-
-            yield Writer()
-        if self.number == 1 and self.close_error:
-            if self.close_loss:
-                with open(self.path, "r+b") as stream:
-                    stream.truncate(self.path.stat().st_size - self.close_loss)
-            raise OSError(errno.ENOSPC, "Injected delayed close failure")
-
-    def reader(self):
-        if self.corrupt:
-            with open(self.path, "r+b") as stream:
-                stream.seek(tb.BLOCK_SIZE + 100)
-                byte = stream.read(1)
-                stream.seek(-1, os.SEEK_CUR)
-                stream.write(bytes([byte[0] ^ 0xFF]))
-        return super().reader()
+        class FaultVolume(tb.Volume):
+            commits = 0
+            def write(self, record):
+                if owner.fail_write and owner.number == 1 and self.stream.tell() >= 3 * tb.BLOCK_SIZE:
+                    owner.fail_write = False
+                    raise OSError(errno.EIO, 'Injected tape failure')
+                if owner.capacity is not None and self.stream.tell() + len(record) > owner.capacity:
+                    left = max(0, owner.capacity - self.stream.tell())
+                    if left:
+                        self.stream.write(record[:left])
+                    raise OSError(errno.ENOSPC, 'Short write' if owner.short else 'End of tape')
+                super().write(record)
+            def commit(self):
+                self.commits += 1
+                if owner.fail_commit and owner.number == 1 and self.commits == 2:
+                    if owner.lost_records:
+                        self.stream.truncate(self.stream.tell() - owner.lost_records * tb.BLOCK_SIZE)
+                    raise OSError(errno.ENOSPC, 'Injected delayed filemark error')
+                super().commit()
+        return FaultVolume(volume.stream)
 
 
-def tree_contents(root):
-    result = {}
-    for path in sorted(root.rglob("*")):
-        name = str(path.relative_to(root))
-        if path.is_symlink():
-            result[name] = ("link", os.readlink(path))
-        elif path.is_dir():
-            result[name] = ("dir", stat.S_IMODE(path.stat().st_mode))
-        else:
-            result[name] = ("file", path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
-    return result
-
-
-class BackupTests(unittest.TestCase):
+class StreamingTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.source = self.root / "source"
+        self.source = self.root / 'source'
         self.source.mkdir()
-        self.state = self.root / "state"
-        self.media_dir = self.root / "media"
-        self.media = FaultMedia(self.media_dir)
-        self.destination = self.root / "restored"
-        self.work = self.root / "restore-work"
+        self.media = FaultMedia(self.root / 'media')
+        self.destination = self.root / 'restored'
         self.quiet = redirect_stderr(io.StringIO())
         self.quiet.__enter__()
         self.addCleanup(self.quiet.__exit__, None, None, None)
-        # Keep tests from flushing unrelated host filesystems. Production uses
-        # os.sync only when publishing a successfully extracted restore tree.
-        self.sync = patch.object(tb.os, "sync")
-        self.sync.start()
-        self.addCleanup(self.sync.stop)
-
-    def create(self, level="full", media=None, size=128 * 1024):
-        return tb.backup(self.state, self.source, level, media or self.media, size)
-
-    def extract(self, catalogs, media=None, destination=None, work=None):
-        return tb.restore(catalogs, destination or self.destination,
-                          work or self.work, media or self.media)
+        sync = patch.object(tb.os, 'sync')
+        sync.start()
+        self.addCleanup(sync.stop)
 
     def seed(self):
-        (self.source / "unchanged").write_bytes(os.urandom(310_000))
-        (self.source / "changed").write_text("original\n")
-        (self.source / "deleted").write_text("delete me")
-        (self.source / "old-dir").mkdir()
-        (self.source / "old-dir" / "child").write_text("child")
-        (self.source / "link").symlink_to("unchanged")
-        (self.source / "executable").write_text("#!/bin/sh\nexit 0\n")
-        (self.source / "executable").chmod(0o751)
-        os.link(self.source / "executable", self.source / "hardlink")
-        (self.source / "space and\nnewline").write_text("odd filename")
-        (self.source / "empty-dir").mkdir()
+        (self.source / 'unchanged').write_bytes(os.urandom(400_000))
+        (self.source / 'changed').write_text('before')
+        (self.source / 'deleted').write_text('delete')
+        (self.source / 'old-dir').mkdir()
+        (self.source / 'old-dir' / 'child').write_text('child')
+        (self.source / 'symlink').symlink_to('unchanged')
+        (self.source / 'executable').write_text('#!/bin/sh\nexit 0\n')
+        (self.source / 'executable').chmod(0o751)
+        os.link(self.source / 'executable', self.source / 'hardlink')
+        (self.source / 'space and\nnewline').write_text('odd name')
+        (self.source / 'empty').mkdir()
 
-    def test_full_backup_spans_volumes_and_restores_metadata(self):
+    def create(self, base=None, media=None, limit=8*tb.BLOCK_SIZE, buffer=tb.BLOCK_SIZE):
+        return tb.backup(self.source, media or self.media,
+                         level='incremental' if base else 'full', base=base,
+                         volume_size=limit, buffer_size=buffer, quiet=True)
+
+    def extract(self, ids, media=None):
+        return tb.restore(ids, self.destination, media or self.media, quiet=True)
+
+    def archive_bytes(self, backup_id):
+        reader = tb.StreamReader(self.media, backup_id)
+        try:
+            return b''.join(data for kind, data in reader.frames() if kind == 'data')
+        finally:
+            reader.close()
+
+    def test_full_backup_streams_and_restores_without_state_or_archive(self):
         self.seed()
-        catalog = self.create()
-        job = tb.read_json(catalog)
-        self.assertGreater(len(job["volumes"]), 2)
-        self.assertEqual(job["status"], "complete")
-        self.extract([catalog])
+        actual_chunks = tb.read_chunks
+        counts = []
+        def observe(stream, size, progress=None):
+            for index, chunk in enumerate(actual_chunks(stream, size, progress)):
+                if progress:
+                    counts.append(len(chunk))
+                    if index:
+                        self.assertGreater(sum(p.stat().st_size for p in self.media.directory.glob('*.tape')),
+                                           tb.BLOCK_SIZE)
+                yield chunk
+        with patch.object(tb, 'read_chunks', side_effect=observe), \
+                patch.object(tb.legacy, 'atomic_json', side_effect=AssertionError('No disk state allowed')):
+            backup_id = self.create()
+        self.assertGreater(len(counts), 2)
+        self.assertLessEqual(max(counts), tb.BLOCK_SIZE)
+        self.assertEqual({p.name for p in self.root.iterdir()}, {'source', 'media'})
+        self.assertFalse(list(self.root.rglob('*.tar')))
+        self.assertFalse(list(self.root.rglob('*.snar')))
+        self.assertFalse(list(self.root.rglob('*.json')))
+        self.extract([backup_id])
         self.assertEqual(tree_contents(self.source), tree_contents(self.destination))
-        self.assertEqual((self.destination / "executable").stat().st_ino,
-                         (self.destination / "hardlink").stat().st_ino)
-        self.assertEqual((self.source / "changed").stat().st_mtime_ns,
-                         (self.destination / "changed").stat().st_mtime_ns)
+        self.assertEqual((self.destination/'executable').stat().st_ino,
+                         (self.destination/'hardlink').stat().st_ino)
 
-    def test_full_and_two_incremental_deltas_restore_exact_tree(self):
+    def test_two_incrementals_use_snapshot_on_tape_and_restore_changes(self):
         self.seed()
         full = self.create()
-        (self.source / "changed").write_text("first change\n")
-        (self.source / "deleted").unlink()
-        (self.source / "added").write_text("new file")
-        (self.source / "old-dir").rename(self.source / "renamed-dir")
-        first = self.create("incremental")
-        with tarfile.open(first.parent / "archive.tar") as archive:
+        (self.source/'changed').write_text('first')
+        (self.source/'deleted').unlink()
+        (self.source/'added').write_text('new')
+        (self.source/'old-dir').rename(self.source/'renamed')
+        first = self.create(full)
+        with tarfile.open(fileobj=io.BytesIO(self.archive_bytes(first))) as archive:
             names = archive.getnames()
-        self.assertIn("./changed", names)
-        self.assertIn("./added", names)
-        self.assertNotIn("./unchanged", names)
-        self.assertNotIn("./deleted", names)
-        shutil.rmtree(self.source / "renamed-dir")
-        (self.source / "changed").write_text("second change\n")
-        (self.source / "added").unlink()
-        (self.source / "final").write_bytes(os.urandom(170_000))
-        second = self.create("incremental")
-        self.assertLess(tb.read_json(first)["archive_size"], tb.read_json(full)["archive_size"])
+        self.assertIn('./changed', names)
+        self.assertNotIn('./unchanged', names)
+        shutil.rmtree(self.source/'renamed')
+        (self.source/'changed').write_text('second')
+        (self.source/'added').unlink()
+        second = self.create(first)
         self.extract([full, first, second])
         self.assertEqual(tree_contents(self.source), tree_contents(self.destination))
 
-    def test_empty_and_unchanged_incremental(self):
+    def test_empty_source_and_unchanged_delta(self):
         full = self.create()
-        delta = self.create("incremental")
+        delta = self.create(full)
         self.extract([full, delta])
         self.assertEqual(list(self.destination.iterdir()), [])
 
-    def test_sparse_file_and_xattrs(self):
-        path = self.source / "sparse"
-        with open(path, "wb") as stream:
-            stream.write(b"start")
-            stream.seek(4 * 1024 * 1024)
-            stream.write(b"end")
-        os.setxattr(path, "user.backup-test", b"preserved")
-        catalog = self.create()
-        self.extract([catalog])
-        restored = self.destination / "sparse"
+    def test_metadata_sparse_files_and_xattrs(self):
+        path = self.source/'sparse'
+        with path.open('wb') as out:
+            out.write(b'begin')
+            out.seek(5*1024**2)
+            out.write(b'end')
+        os.setxattr(path, 'user.tape-test', b'value')
+        full = self.create()
+        self.extract([full])
+        restored = self.destination/'sparse'
         self.assertEqual(path.read_bytes(), restored.read_bytes())
-        self.assertEqual(os.getxattr(restored, "user.backup-test"), b"preserved")
-        self.assertLess(restored.stat().st_blocks * 512, restored.stat().st_size)
+        self.assertEqual(path.stat().st_mtime_ns, restored.stat().st_mtime_ns)
+        self.assertEqual(os.getxattr(restored, 'user.tape-test'), b'value')
+        self.assertLess(restored.stat().st_blocks*512, restored.stat().st_size)
 
-    def test_enospc_and_short_writes_roll_over_without_data_loss(self):
+    def test_end_of_tape_and_partial_records_replay_from_ram(self):
         self.seed()
         for short in (False, True):
             with self.subTest(short=short):
-                media = FaultMedia(self.media_dir / str(short),
-                                   capacity=3 * tb.BLOCK_SIZE + 100, short=short)
-                state = self.root / f"state-{short}"
-                catalog = tb.backup(state, self.source, "full", media)
-                job = tb.read_json(catalog)
-                self.assertGreater(len(job["volumes"]), 1)
-                self.assertEqual(job["volumes"][0]["size"], 2 * tb.BLOCK_SIZE)
-                self.extract([catalog], media, self.root / f"dest-{short}",
-                             self.root / f"work-{short}")
-                self.assertEqual(tree_contents(self.source),
-                                 tree_contents(self.root / f"dest-{short}"))
+                media = FaultMedia(self.root/f'media-{short}', capacity=6*tb.BLOCK_SIZE+100, short=short)
+                full = self.create(media=media, limit=None, buffer=2*tb.BLOCK_SIZE)
+                summary = tb.scan(media, full)
+                self.assertGreater(summary['volumes'], 1)
+                dest = self.root/f'restored-{short}'
+                tb.restore([full], dest, media, quiet=True)
+                self.assertEqual(tree_contents(self.source), tree_contents(dest))
 
-    def test_delayed_close_enospc_replays_lost_buffered_tail(self):
+    def test_delayed_commit_error_replays_whole_or_lost_buffered_chunk(self):
         self.seed()
-        media = FaultMedia(self.media_dir, close_error=True, close_loss=tb.BLOCK_SIZE)
-        catalog = self.create(media=media, size=3 * tb.BLOCK_SIZE)
-        job = tb.read_json(catalog)
-        self.assertEqual(job["volumes"][0]["size"], 2 * tb.BLOCK_SIZE)
-        self.extract([catalog])
+        for lost in (0, 1, 2):
+            with self.subTest(lost=lost):
+                media = FaultMedia(self.root/f'media-{lost}', fail_commit=True, lost_records=lost)
+                full = self.create(media=media, limit=None, buffer=2*tb.BLOCK_SIZE)
+                dest = self.root/f'restored-{lost}'
+                tb.restore([full], dest, media, quiet=True)
+                self.assertEqual(tree_contents(self.source), tree_contents(dest))
+
+    def test_io_error_continues_on_replacement_volume(self):
+        self.seed()
+        media = FaultMedia(self.media.directory, fail_write=True)
+        full = self.create(media=media, limit=None)
+        self.assertGreater(tb.scan(media, full)['volumes'], 1)
+        self.extract([full], media)
         self.assertEqual(tree_contents(self.source), tree_contents(self.destination))
 
-    def test_delayed_close_error_with_all_data_durable(self):
-        (self.source / "small").write_text("small")
-        catalog = self.create(media=FaultMedia(self.media_dir, close_error=True))
-        self.assertEqual(len(tb.read_json(catalog)["volumes"]), 1)
-        self.extract([catalog])
-        self.assertEqual(tree_contents(self.source), tree_contents(self.destination))
-
-    def test_failure_resumes_from_last_verified_volume(self):
+    def test_no_progress_stops_after_three_tapes(self):
         self.seed()
-        broken = FaultMedia(self.media_dir, fail_volume=2)
-        with self.assertRaises(OSError):
-            self.create(media=broken)
-        index = tb.index_for(self.state)
-        self.assertIsNone(index["head"])
-        pending = tb.job_path(self.state, index["pending"]) / "catalog.json"
-        self.assertEqual(len(tb.read_json(pending)["volumes"]), 1)
-        first = self.media_dir / f"{index['pending']}.0001.tape"
-        first_digest = tb.digest_file(first)
-        catalog = tb.resume(self.state, self.media)
-        self.assertEqual(self.media.loads[0][1], 2)
-        self.assertEqual(tb.digest_file(first), first_digest)
-        self.extract([catalog])
-        self.assertEqual(tree_contents(self.source), tree_contents(self.destination))
+        media = FaultMedia(self.media.directory, capacity=2*tb.BLOCK_SIZE)
+        with self.assertRaisesRegex(tb.BackupError, 'Three volumes'):
+            self.create(media=media, limit=None)
+        self.assertEqual(len(list(self.media.directory.glob('*.tape'))), 3)
 
-    def test_resume_uses_staged_archive_when_source_is_unavailable(self):
-        self.seed()
-        expected = tree_contents(self.source)
-        with self.assertRaises(OSError):
-            self.create(media=FaultMedia(self.media_dir, fail_volume=2))
-        shutil.rmtree(self.source)
-        catalog = tb.resume(self.state, self.media)
-        self.extract([catalog])
-        self.assertEqual(expected, tree_contents(self.destination))
-
-    def test_failed_incremental_does_not_advance_snapshot(self):
+    def test_corrupt_payload_is_rejected_without_publishing_restore(self):
         self.seed()
         full = self.create()
-        snapshot_before = (full.parent / "snapshot.snar").read_bytes()
-        (self.source / "changed").write_text("included in staged delta")
-        with self.assertRaises(OSError):
-            self.create("incremental", FaultMedia(self.media_dir, fail_volume=1))
-        self.assertEqual(tb.index_for(self.state)["head"], tb.read_json(full)["id"])
-        self.assertEqual((full.parent / "snapshot.snar").read_bytes(), snapshot_before)
-        (self.source / "after-failure").write_text("must be in next delta")
-        first = tb.resume(self.state, self.media)
-        with tarfile.open(first.parent / "archive.tar") as archive:
-            self.assertNotIn("./after-failure", archive.getnames())
-        second = self.create("incremental")
-        self.extract([full, first, second])
-        self.assertEqual(tree_contents(self.source), tree_contents(self.destination))
-
-    def test_interrupted_tar_creation_restarts_from_committed_snapshot(self):
-        self.seed()
-        full = self.create()
-        (self.source / "changed").write_text("a change")
-        real_run = tb.run_command
-
-        def fail_tar(command):
-            output = real_run(command)
-            if "--create" in command:
-                raise tb.BackupError("Injected tar failure after updating working snapshot")
-            return output
-
-        with patch.object(tb, "run_command", side_effect=fail_tar):
-            with self.assertRaises(tb.BackupError):
-                self.create("incremental")
-        (self.source / "later").write_text("added before retry")
-        delta = tb.resume(self.state, self.media)
-        with tarfile.open(delta.parent / "archive.tar") as archive:
-            self.assertIn("./changed", archive.getnames())
-            self.assertIn("./later", archive.getnames())
-        self.extract([full, delta])
-        self.assertEqual(tree_contents(self.source), tree_contents(self.destination))
-
-    def test_interrupted_final_commit_is_idempotent(self):
-        self.seed()
-        real_save = tb.atomic_json
-
-        def fail_final(path, data):
-            if path.name == "index.json" and data.get("head"):
-                raise OSError(errno.EIO, "Injected checkpoint failure")
-            real_save(path, data)
-
-        with patch.object(tb, "atomic_json", side_effect=fail_final):
-            with self.assertRaises(OSError):
-                self.create()
-        self.media.loads.clear()
-        catalog = tb.resume(self.state, self.media)
-        self.assertEqual(self.media.loads, [])
-        self.assertIsNone(tb.index_for(self.state)["pending"])
-        self.extract([catalog])
-        self.assertEqual(tree_contents(self.source), tree_contents(self.destination))
-
-    def test_interrupted_volume_checkpoint_replays_only_uncommitted_volume(self):
-        self.seed()
-        real_save = tb.atomic_json
-
-        def fail_second_volume(path, data):
-            if path.name == "catalog.json" and len(data.get("volumes", [])) == 2:
-                raise OSError(errno.EIO, "Injected checkpoint failure")
-            real_save(path, data)
-
-        with patch.object(tb, "atomic_json", side_effect=fail_second_volume):
-            with self.assertRaises(OSError):
-                self.create()
-        self.media.loads.clear()
-        catalog = tb.resume(self.state, self.media)
-        self.assertEqual(self.media.loads[0][1], 2)
-        self.extract([catalog])
-        self.assertEqual(tree_contents(self.source), tree_contents(self.destination))
-
-    def test_corrupt_readback_never_commits_volume(self):
-        self.seed()
-        with self.assertRaisesRegex(tb.BackupError, "verification"):
-            self.create(media=FaultMedia(self.media_dir, corrupt=True))
-        index = tb.index_for(self.state)
-        self.assertIsNone(index["head"])
-        job = tb.read_json(tb.job_path(self.state, index["pending"]) / "catalog.json")
-        self.assertEqual(job["volumes"], [])
-        tb.resume(self.state, self.media)
-
-    def test_zero_progress_stops_instead_of_requesting_tapes_forever(self):
-        self.seed()
-        with self.assertRaisesRegex(tb.BackupError, "no complete data"):
-            self.create(media=FaultMedia(self.media_dir, capacity=tb.BLOCK_SIZE))
-        self.assertIsNone(tb.index_for(self.state)["head"])
-
-    def test_corrupt_staged_archive_refuses_resume(self):
-        self.seed()
-        with self.assertRaises(OSError):
-            self.create(media=FaultMedia(self.media_dir, fail_volume=2))
-        pending = tb.index_for(self.state)["pending"]
-        with open(tb.job_path(self.state, pending) / "archive.tar", "ab") as stream:
-            stream.write(b"corruption")
-        with self.assertRaisesRegex(tb.BackupError, "corrupt"):
-            tb.resume(self.state, self.media)
-
-    def test_missing_or_corrupt_tape_preserves_destination_and_restore_resumes(self):
-        self.seed()
-        catalog = self.create()
-        job = tb.read_json(catalog)
-        missing = self.media_dir / f"{job['id']}.0002.tape"
-        original = missing.read_bytes()
-        missing.unlink()
-        with self.assertRaises(OSError):
-            self.extract([catalog])
+        volume = self.media.directory/f'{full}.0001.tape'
+        with volume.open('r+b') as stream:
+            stream.seek(2*tb.BLOCK_SIZE+100)
+            byte = stream.read(1)
+            stream.seek(-1, 1)
+            stream.write(bytes([byte[0] ^ 0xff]))
+        with self.assertRaisesRegex(tb.BackupError, 'Checksum'):
+            self.extract([full])
         self.assertFalse(self.destination.exists())
-        missing.write_bytes(original)
-        self.media.loads.clear()
-        self.extract([catalog])
-        self.assertEqual(self.media.loads[0][1], 2)
-        self.assertEqual(tree_contents(self.source), tree_contents(self.destination))
+        self.assertFalse(list(self.root.glob('.restored.restoring-*')))
 
-    def test_corrupt_and_wrong_tapes_are_rejected_before_extraction(self):
+    def test_wrong_volume_is_rejected(self):
         self.seed()
-        catalog = self.create()
-        job = tb.read_json(catalog)
-        volume = self.media_dir / f"{job['id']}.0001.tape"
-        original = volume.read_bytes()
-        for location, message in [(tb.BLOCK_SIZE + 100, "Checksum"), (0, "Wrong or corrupt")]:
-            with self.subTest(location=location):
-                damaged = bytearray(original)
-                damaged[location] ^= 0xFF
-                volume.write_bytes(damaged)
-                with self.assertRaisesRegex(tb.BackupError, message):
-                    self.extract([catalog])
-                self.assertFalse(self.destination.exists())
-        volume.write_bytes(original)
-        self.extract([catalog])
-
-    def test_truncated_tape_is_rejected(self):
-        self.seed()
-        catalog = self.create()
-        volume = self.media_dir / f"{tb.read_json(catalog)['id']}.0001.tape"
-        with open(volume, "r+b") as stream:
-            stream.truncate(tb.BLOCK_SIZE + 100)
-        with self.assertRaisesRegex(tb.BackupError, "Truncated"):
-            self.extract([catalog])
+        full = self.create()
+        first = self.media.directory/f'{full}.0001.tape'
+        second = self.media.directory/f'{full}.0002.tape'
+        second.write_bytes(first.read_bytes())
+        with self.assertRaisesRegex(tb.BackupError, 'Wrong'):
+            self.extract([full])
         self.assertFalse(self.destination.exists())
 
-    def test_extraction_failure_replays_chain_in_private_tree(self):
+    def test_missing_final_marker_is_an_incomplete_backup(self):
         self.seed()
         full = self.create()
-        (self.source / "changed").write_text("new")
-        delta = self.create("incremental")
-        real_run = tb.run_command
-        extracts = 0
-
-        def fail_extract(command):
-            nonlocal extracts
-            if "--extract" in command:
-                extracts += 1
-                if extracts == 2:
-                    raise tb.BackupError("Injected extraction failure")
-            return real_run(command)
-
-        with patch.object(tb, "run_command", side_effect=fail_extract):
-            with self.assertRaisesRegex(tb.BackupError, "Injected"):
-                self.extract([full, delta])
+        last = sorted(self.media.directory.glob(f'{full}.*.tape'))[-1]
+        with last.open('r+b') as stream:
+            stream.truncate(last.stat().st_size-2*tb.BLOCK_SIZE)
+        with self.assertRaisesRegex(tb.BackupError, 'Incomplete'):
+            self.extract([full])
         self.assertFalse(self.destination.exists())
-        self.media.loads.clear()
-        self.extract([full, delta])
-        self.assertEqual(self.media.loads, [])
-        self.assertEqual(tree_contents(self.source), tree_contents(self.destination))
 
-    def test_interrupted_restore_publication_is_idempotent(self):
-        self.seed()
-        catalog = self.create()
-        real_save = tb.atomic_json
-
-        def fail_done(path, data):
-            if path.name == "restore.json" and data.get("phase") == "done":
-                raise OSError(errno.EIO, "Injected final restore checkpoint failure")
-            real_save(path, data)
-
-        with patch.object(tb, "atomic_json", side_effect=fail_done):
-            with self.assertRaises(OSError):
-                self.extract([catalog])
-        self.assertEqual(tree_contents(self.source), tree_contents(self.destination))
-        self.media.loads.clear()
-        self.extract([catalog])
-        self.assertEqual(self.media.loads, [])
-
-    def test_invalid_volume_offsets_and_incomplete_catalog_are_rejected(self):
-        self.seed()
-        catalog = self.create()
-        job = tb.read_json(catalog)
-        job["volumes"][1]["offset"] += 1
-        tb.atomic_json(catalog, job)
-        with self.assertRaisesRegex(tb.BackupError, "volumes"):
-            self.extract([catalog])
-        job["status"] = "ready"
-        tb.atomic_json(catalog, job)
-        with self.assertRaisesRegex(tb.BackupError, "incomplete"):
-            self.extract([catalog])
-
-    def test_chain_order_and_missing_parent_rejected(self):
+    def test_parent_and_order_validation(self):
         self.seed()
         full = self.create()
-        first = self.create("incremental")
-        second = self.create("incremental")
-        for chain in ([first], [first, full], [full, second], [full, first, first]):
+        first = self.create(full)
+        second = self.create(first)
+        for chain in ([first], [full, second], [full, first, first]):
             with self.subTest(chain=chain), self.assertRaises(tb.BackupError):
                 self.extract(chain)
         self.assertFalse(self.destination.exists())
 
-    def test_source_mismatch_and_nested_state_rejected(self):
+    def test_incomplete_parent_cannot_start_incremental(self):
         self.seed()
-        self.create()
-        other = self.root / "other-source"
-        other.mkdir()
-        with self.assertRaisesRegex(tb.BackupError, "source differs"):
-            tb.backup(self.state, other, "incremental", self.media)
-        with self.assertRaisesRegex(tb.BackupError, "separate"):
-            tb.backup(self.source / "state", self.source, "full", self.media)
+        full = self.create()
+        last = sorted(self.media.directory.glob(f'{full}.*.tape'))[-1]
+        last.unlink()
+        before = set(self.media.directory.iterdir())
+        with self.assertRaisesRegex(tb.BackupError, 'Incomplete'):
+            self.create(full)
+        self.assertEqual(set(self.media.directory.iterdir()), before)
 
-    def test_new_incremental_without_full_and_concurrent_backup_rejected(self):
-        with self.assertRaisesRegex(tb.BackupError, "requires"):
-            self.create("incremental")
-        with tb.locked(self.state), self.assertRaisesRegex(tb.BackupError, "Another operation"):
-            self.create()
-
-    def test_restore_does_not_overwrite_existing_files(self):
+    def test_restore_after_source_and_everything_except_tapes_are_removed(self):
         self.seed()
-        catalog = self.create()
+        full = self.create()
+        expected = tree_contents(self.source)
+        shutil.rmtree(self.source)
+        self.extract([full])
+        self.assertEqual(tree_contents(self.destination), expected)
+
+    def test_inspect_discovers_id_and_skips_payload_but_verify_checks_it(self):
+        self.seed()
+        full = self.create()
+        with patch.object(tb.Volume, 'skip_payload', autospec=True,
+                          side_effect=tb.Volume.skip_payload) as skip:
+            info = tb.scan(self.media, verify=False)
+            self.assertGreater(skip.call_count, 1)
+        self.assertEqual(info['id'], full)
+        self.assertFalse(info['data_verified'])
+        self.assertTrue(tb.scan(self.media, full)['data_verified'])
+
+    def test_bad_source_and_small_buffer_or_volume_rejected(self):
+        with self.assertRaises(tb.BackupError):
+            tb.backup(self.source, self.media, level='incremental', quiet=True)
+        for opts in ({'buffer_size': 1}, {'volume_size': 1024}, {'buffer_size': tb.MAX_BUFFER+1}):
+            with self.subTest(opts=opts), self.assertRaises(tb.BackupError):
+                tb.backup(self.source, self.media, quiet=True, **opts)
+        with self.assertRaisesRegex(tb.BackupError, 'separate'):
+            tb.backup(self.source, tb.FileMedia(self.source/'media'), quiet=True)
+
+    def test_existing_destination_is_not_overwritten(self):
+        full = self.create()
         self.destination.mkdir()
-        (self.destination / "keep").write_text("untouched")
-        with self.assertRaisesRegex(tb.BackupError, "empty directory"):
-            self.extract([catalog])
-        self.assertEqual((self.destination / "keep").read_text(), "untouched")
+        (self.destination/'keep').write_text('important')
+        with self.assertRaisesRegex(tb.BackupError, 'empty'):
+            self.extract([full])
+        self.assertEqual((self.destination/'keep').read_text(), 'important')
 
-    def test_device_default_override_and_mutual_exclusion(self):
-        parser = tb.make_parser()
-        base = ["backup", "--state", "state", "--source", "source"]
-        self.assertEqual(parser.parse_args(base).device, "/dev/nst0")
-        self.assertEqual(parser.parse_args(base + ["--device", "/dev/nst1"]).device, "/dev/nst1")
-        with self.assertRaises(SystemExit):
-            parser.parse_args(base + ["--device", "/dev/nst1", "--media-dir", "media"])
-        for command in ("resume", "restore"):
-            args = [command, "--state", "state"] if command == "resume" else [
-                command, "--catalog", "catalog", "--destination", "dest", "--work-dir", "work"]
-            self.assertEqual(parser.parse_args(args + ["--device", "/dev/nst2"]).device, "/dev/nst2")
+    def test_actual_short_write_is_recoverable(self):
+        stream = Mock()
+        stream.write.return_value = 10
+        with self.assertRaises(OSError) as error:
+            tb.Volume(stream).write(b'x'*tb.BLOCK_SIZE)
+        self.assertEqual(error.exception.errno, errno.ENOSPC)
 
-    def test_external_commands_receive_original_library_path_in_binary(self):
-        completed = SimpleNamespace(returncode=0, stdout="", stderr="")
-        for frozen, original in [(True, None), (True, "/opt/system-libs"),
-                                 (True, ""), (False, None)]:
-            with self.subTest(frozen=frozen, original=original):
-                env = {"LD_LIBRARY_PATH": "/tmp/_MEI-bundled-libs", "TAR_OPTIONS": "--invalid"}
-                if original is not None:
-                    env["LD_LIBRARY_PATH_ORIG"] = original
-                with patch.dict(tb.os.environ, env, clear=True), \
-                        patch.object(tb.sys, "frozen", frozen, create=True), \
-                        patch.object(tb.subprocess, "run", return_value=completed) as run:
-                    tb.run_command(["tar", "--version"])
-                    passed = run.call_args.kwargs["env"]
-                    self.assertNotIn("TAR_OPTIONS", passed)
-                    self.assertEqual(passed.get("LD_LIBRARY_PATH"),
-                                     original if frozen else env["LD_LIBRARY_PATH"])
-                    self.assertNotIn("LD_LIBRARY_PATH_ORIG", passed)
-                    self.assertEqual(tb.os.environ["LD_LIBRARY_PATH"], env["LD_LIBRARY_PATH"])
+    def test_tape_commit_uses_synchronous_filemark_and_skip_uses_fsf(self):
+        stream = Mock()
+        stream.fileno.return_value = 42
+        volume = tb.Volume(stream, physical=True)
+        with patch.object(tb.fcntl, 'ioctl') as ioctl:
+            volume.commit()
+            ioctl.assert_called_with(42, tb.MTIOCTOP, struct.pack('@hi', tb.MTWEOF, 1))
+            volume.skip_payload(128000)
+            ioctl.assert_called_with(42, tb.MTIOCTOP, struct.pack('@hi', tb.MTFSF, 1))
 
-    def test_tape_adapter_loads_selected_drive_and_rewinds_for_verification(self):
-        info = SimpleNamespace(st_mode=stat.S_IFCHR, st_rdev=os.makedev(9, 129))
-        with patch.object(tb.os, "stat", return_value=info), patch.object(tb.shutil, "which", return_value="/bin/mt"):
-            media = tb.TapeMedia("/dev/nst1", "/usr/local/bin/load-tape")
-        with patch.object(tb, "run_command", return_value="") as command:
-            media.load({"id": "backup-id"}, 3, True)
-            self.assertEqual(command.call_args_list[0].args[0], [
-                "/usr/local/bin/load-tape", "write", "backup-id", "3", "/dev/nst1"])
-            self.assertEqual(command.call_args_list[1].args[0], ["mt", "-f", "/dev/nst1", "rewind"])
-            self.assertEqual(command.call_args_list[2].args[0], ["mt", "-f", "/dev/nst1", "setblk", "0"])
-            with patch("builtins.open", return_value=io.BytesIO()) as opened:
-                media.reader().close()
-                opened.assert_called_once_with("/dev/nst1", "rb", buffering=0)
-            self.assertEqual(command.call_args.args[0], ["mt", "-f", "/dev/nst1", "rewind"])
-            media.release()
-            self.assertEqual(command.call_args.args[0], ["mt", "-f", "/dev/nst1", "offline"])
+    def test_filemarks_are_crossed_only_between_frames(self):
+        stream = Mock()
+        stream.read.side_effect = [b'', b'x'*tb.BLOCK_SIZE, b'']
+        volume = tb.Volume(stream, physical=True)
+        self.assertEqual(volume.read(boundary=True), b'x'*tb.BLOCK_SIZE)
+        with self.assertRaises(tb.EndVolume):
+            volume.read()
 
-    def test_rewinding_tape_device_is_rejected(self):
-        info = SimpleNamespace(st_mode=stat.S_IFCHR, st_rdev=os.makedev(9, 0))
-        with patch.object(tb.os, "stat", return_value=info):
-            with self.assertRaisesRegex(tb.BackupError, "non-rewinding"):
-                tb.TapeMedia("/dev/st0")
+    def test_immediate_tape_filemarks_are_disabled_before_rewind(self):
+        media = object.__new__(tb.TapeMedia)
+        media.device = '/dev/nst1'
+        with patch.object(Path, 'read_text', return_value='0x8000'), \
+                patch.object(tb.legacy.TapeMedia, 'mt') as mt:
+            media.mt('rewind')
+            self.assertEqual(mt.call_args_list[0].args, ('stclearoptions', '0xa000'))
+            self.assertEqual(mt.call_args_list[1].args, ('rewind',))
 
-    def test_cli_full_incremental_restore_and_status(self):
-        script = str(Path(tb.__file__).resolve())
+    def test_eta_uses_payload_completion_and_reports_measured_rate(self):
+        progress = tb.Progress('Test')
+        progress.started = progress.last_time = progress.eta_started = 0
+        progress.total_bytes = 200 * 1024**2
+        progress.written_bytes = 100 * 1024**2
+        progress.transferred = 120 * 1024**2
+        output = io.StringIO()
+        with patch.object(tb.time, 'monotonic', return_value=60), redirect_stderr(output):
+            progress.report()
+        self.assertIn('2.0 MiB/s I/O', output.getvalue())
+        self.assertIn('ETA ~00:01:00', output.getvalue())
 
-        def run(*args):
-            result = subprocess.run([sys.executable, script, *map(str, args)],
-                                    capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            return result.stdout.strip()
-
+    def test_eta_inventory_reads_metadata_not_file_contents(self):
         self.seed()
-        common = ["--state", self.state, "--source", self.source,
-                  "--media-dir", self.media_dir, "--volume-size", "128KiB"]
-        self.assertEqual(run("--version"), "tape_backup.py 0.1.0")
-        full = run("backup", *common)
-        (self.source / "changed").write_text("CLI delta")
-        (self.source / "deleted").unlink()
-        delta = run("backup", *common, "--level", "incremental")
-        run("restore", "--catalog", full, delta, "--destination", self.destination,
-            "--work-dir", self.work, "--media-dir", self.media_dir)
-        self.assertEqual(tree_contents(self.source), tree_contents(self.destination))
-        self.assertIn('"pending": null', run("status", "--state", self.state))
+        with patch('builtins.open', side_effect=AssertionError('No payload reading during estimate')):
+            estimate = tb.estimate_source(self.source)
+        self.assertGreater(estimate, 400000)
+
+    def test_parser_does_not_require_state_and_preserves_device_selection(self):
+        parser = tb.make_parser()
+        args = parser.parse_args(['backup', '--source', '/data', '--device', '/dev/nst1'])
+        self.assertEqual(args.device, '/dev/nst1')
+        self.assertFalse(hasattr(args, 'state'))
+        with self.assertRaises(SystemExit):
+            parser.parse_args(['backup', '--source', '/data', '--state', '/state'])
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()

@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.0
+
+- Stream GNU tar directly from source to tape and from tape into restored files.
+  Remove required state directories, disk archive staging, and external catalogs
+  from the default backup/restore workflow.
+- Store incremental snapshots, identifiers, checksums, and completion markers on
+  the tape set. `--base ID` reads the preceding snapshot from tape into RAM.
+- Retain bounded chunks in RAM until synchronous filemark flushes succeed; replay
+  incomplete or uncertain writes on the next volume and deduplicate on restore.
+- Print file names by default, with five-second progress updates, I/O transfer
+  rates, average speed, elapsed time, and approximate current-archive ETA.
+- Add `--quiet`, `--buffer-size`, `inspect`, and full read-back `verify` commands.
+- Preserve v0.1 recovery through `legacy-restore` with the original catalogs.
+- Expand validation to 60 passing tests, including the standalone executable and
+  streaming restores with no Python installed in the runtime container.
+
+This changes the default CLI and tape format. Start a new full backup when moving
+to streaming mode. In-process tape rollover/retry is supported; after interruption
+or power loss, restart the backup from the source on fresh tapes. Restore also
+restarts from its first tape. No persistent byte-resume checkpoint is kept.
+Physical tape hardware remains untested.
+
 ## 0.1.0
 
 Initial release of the Linux tape backup and restore tool.

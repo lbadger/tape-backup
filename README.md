@@ -1,280 +1,272 @@
 # Tape backup and restore
 
-`tape_backup.py` creates full and incremental GNU tar archives, writes them across
-multiple tape cartridges, verifies them by reading them back, and restores an
-ordered backup chain. Linux `/dev/nst0` is the default; `--device /dev/nst1` selects
-another drive. There are no third-party Python dependencies.
+`tape-backup` streams full and incremental GNU tar archives directly between a
+source directory and a Linux tape drive. Version 0.2 requires **no `--state`
+directory, no disk copy of the archive, and no external restore catalog**.
+Checksums, backup-chain identifiers, completion information, and the incremental
+snapshot are carried on the tapes.
 
-## Requirements
+Backup and restore print file names, transfer totals, current and average MiB/s,
+elapsed time, and an approximate ETA. `/dev/nst0` is the default; use `--device`
+to select another non-rewinding tape drive.
 
-- Linux, GNU tar, and `mt` from the `mt-st` package. Running the source script
-  requires Python 3.11 or newer; the standalone executable includes Python.
-- A non-rewinding Linux SCSI tape device supporting variable-length 64 KiB
-  records, and permission to read, write, rewind, and unload it.
-- Local disk space to stage the complete tar archive before writing tapes.
-- Separate source, state, and optional file-media directories.
+## Download
 
-On Debian/Ubuntu, install dependencies with `sudo apt install python3 tar mt-st`.
-Use a filesystem snapshot or quiesce applications while tar reads the source.
-Any nonzero tar exit status, including “file changed as we read it,” fails staging
-and leaves the previous incremental baseline intact. This is a directory backup
-tool; filesystem snapshots and application/database consistency are managed by
-the operator. It does not follow symlinks, and it includes mounted directories
-beneath the source.
-
-## Standalone Linux executable
-
-Download the Linux x86-64 executable and its checksum from the
-[v0.1.0 release](https://github.com/lbadger/tape-backup/releases/tag/v0.1.0):
+Download the executable and checksum from the
+[v0.2.0 release](https://github.com/lbadger/tape-backup/releases/tag/v0.2.0):
 
 ```bash
-curl -fLO https://github.com/lbadger/tape-backup/releases/download/v0.1.0/tape-backup
-curl -fLO https://github.com/lbadger/tape-backup/releases/download/v0.1.0/tape-backup.sha256
+curl -fLO https://github.com/lbadger/tape-backup/releases/download/v0.2.0/tape-backup
+curl -fLO https://github.com/lbadger/tape-backup/releases/download/v0.2.0/tape-backup.sha256
 sha256sum --check tape-backup.sha256
 chmod +x tape-backup
 ./tape-backup --version
 ```
 
-Build a single executable using Docker with BuildKit:
+The supplied binary is Linux x86-64, built against glibc 2.31. It embeds Python;
+Python and Docker are not required at runtime. Install GNU tar and `mt` from
+`mt-st` (`sudo apt install tar mt-st` on Debian/Ubuntu). Normal Linux runtime
+libraries, including glibc and zlib, are required. Alpine/musl needs a separate
+build. Running the source requires Python 3.11+ and the adjacent `legacy_v1.py`.
+
+Use a Linux SCSI tape drive supporting variable-length 64 KiB records. The user
+must have permission to operate the device. The script disables immediate rewind
+and filemark modes when necessary; changing those driver settings may require
+root. Run it with exclusive access to the drive. Locks prevent competing jobs
+under the same Unix account, but cannot exclude other tape programs or accounts.
+
+## Full backup
 
 ```bash
+./tape-backup backup --source /opt/audiobooks --level full --device /dev/nst0
+```
+
+There is no `--state` argument. The script inventories file metadata to estimate
+size, loads a tape, and starts GNU tar with its output piped to the tape writer.
+Source file contents are never staged on disk. A successful command prints the
+backup ID on stdout; progress and file names go to stderr. Label every cartridge
+with that ID and the volume number shown in the prompt.
+
+**Writing rewinds and overwrites the loaded cartridge.** Each new volume uses a
+fresh writable cartridge. Backup IDs describe one full or incremental archive;
+a new backup starts on fresh media rather than appending to an existing tape.
+
+Omit `--volume-size` to continue until the drive reports end of medium. To impose
+an earlier limit, for example:
+
+```bash
+./tape-backup backup --source /opt/audiobooks --volume-size 100GiB
+```
+
+This cap counts formatted record bytes, including headers and padding, but not
+physical tape filemarks or drive overhead. Actual end-of-medium handling still
+applies. Sizes accept integer bytes or integer `KiB`, `MiB`, `GiB`, or `TiB` values.
+The minimum volume limit is 256 KiB.
+
+Use a filesystem snapshot or quiesce applications while backing up. GNU tar errors,
+including changed/unreadable files, prevent writing the final completion marker.
+This tool does not establish database or application consistency. It includes
+mounted directories beneath the source and does not follow symlinks.
+
+## Incremental backup without a local snapshot
+
+An incremental needs the snapshot from the previous **completed** backup. It reads
+that snapshot from the previous tape set into a temporary Linux memory-backed
+file, then writes a new backup to fresh tapes:
+
+```bash
+./tape-backup backup --source /opt/audiobooks --level incremental \
+  --base PREVIOUS_BACKUP_ID --device /dev/nst0
+```
+
+Load the previous backup's volumes in order when prompted, followed by fresh
+writable tapes for the new backup. The metadata reader uses tape filemarks to
+skip archive payloads, avoiding transfer of the old file contents through RAM.
+Mechanical tape traversal still takes time. No persistent snapshot/cache file is
+required. Metadata memory consumption grows with the number of filenames.
+
+Each incremental is relative to the backup specified by `--base`. For a linear
+chain, pass the most recent successful backup ID. The source directory must match.
+All ancestors, beginning with a full backup, are needed for restore. A new full
+backup starts an independent chain. An incomplete tape set cannot be used as a
+base.
+
+## Restore directly from tape
+
+Pass a full backup ID, followed by every incremental ID to the desired recovery
+point, in order:
+
+```bash
+./tape-backup restore --backup FULL_ID DELTA_1_ID DELTA_2_ID \
+  --destination /srv/recovered --device /dev/nst0
+```
+
+For a full-only restore, specify just the full ID. Tape headers contain the
+metadata required for restore; the original machine, source directory, external
+catalogs, and local incremental snapshots are unnecessary.
+
+Restore validates each in-memory chunk before passing its archive bytes to GNU
+tar. It applies additions, changes, deletions, and renames from the ordered chain.
+An empty or absent destination is required. Files are extracted into a private
+sibling directory and renamed into the destination only after the full chain and
+its completion markers have been verified.
+
+**Restore writes only the extracted files, not a reassembled tar archive.** Allow
+space for the largest intermediate directory tree in the chain, including files
+later deleted by an incremental. Publication uses a rename, without copying the
+restored tree. Permissions, timestamps, links, sparse files, ACLs, and extended
+attributes are restored where supported; arbitrary ownership and privileged
+metadata generally require root. Restore only trusted tape sets, especially as
+root. Checksums detect corruption but are not signatures or encryption.
+
+## Progress, transfer rates, and ETA
+
+File names are printed by default. A status line is printed every five seconds
+and at completion, for example:
+
+```text
+BACKUP_ID: streaming to volume 1; 8192.0 MiB read, 8128.0 MiB delivered; 155.0 MiB/s I/O, 149.3 MiB/s average; ETA ~02:14:08 (current archive); 55s elapsed
+```
+
+I/O rates measure bytes passed to/from the device, including framing, padding,
+and retries. They are host-side rates, not measurements of physical tape motion
+or compressed media capacity. Delivered backup bytes have passed a synchronous
+filemark flush. Restore delivery counts archive bytes passed to GNU tar. The
+average includes elapsed media-change time.
+
+The ETA estimates remaining time for the **current archive**, not later
+incrementals in a restore chain. Backup estimates come from file metadata only;
+restore uses that estimate from the tape header. Sparse files, incremental
+selection, directory changes, media changes, and final flushing can affect its
+accuracy. It starts as `calculating` and shows `finishing (estimate reached)` when
+an underestimated archive is still running. No source contents are read merely
+to calculate the estimate.
+
+`--quiet` suppresses per-file output while retaining rates, ETA, summaries, and
+errors. Large-file transfers still produce periodic status lines.
+
+## Bounded buffering and failure recovery
+
+The default retry chunk is 64 MiB; adjust it with `--buffer-size`, between 64 KiB
+and 256 MiB. The payload buffer is bounded independently of archive size. Peak
+memory also includes Python/GNU tar overhead, temporary chunk copies, and the
+incremental snapshot metadata. The volume cap can reduce the effective chunk
+size. Larger chunks reduce filemark overhead; smaller chunks reduce RAM use and
+retry work.
+
+Each chunk has an identifier, length, checksum, and link to the preceding chunk.
+The writer retains it in RAM until a synchronous tape filemark commits it. On a
+short write, end-of-tape indication, or write I/O error, it requests another tape
+and replays the pending chunk. **Keep the earlier volume**, including one that
+ended in a write error: it may contain previously committed data. Restore handles
+an incomplete tail or a complete duplicate chunk after a failed flush. Repeated
+failures without progress stop the job.
+
+A final completion marker is written only after GNU tar exits successfully and
+the new incremental snapshot has been recorded. Missing chunks, wrong tapes,
+checksum failures, and incomplete sets are rejected. Backup flushes each chunk
+but does not perform automatic read-back verification; use `verify` for a full
+read pass.
+
+**A stopped/killed process or power failure requires restarting the backup from
+the source on fresh media.** There is no persistent byte-resume checkpoint. The
+previous completed backup remains usable as the next incremental base. Repeat
+an interrupted restore from its first tape. Ordinary failures clean up the private
+restore tree; after SIGKILL or power loss, an abandoned `.DEST.restoring-*` sibling
+may remain and can be removed after confirming it belongs to that failed restore.
+
+The executable itself extracts its bundled runtime into a temporary directory;
+this is a small runtime footprint, not backup staging. A few fixed-size lock files
+are also used. `TMPDIR` must support executable mappings and symlinks when running
+the standalone executable.
+
+## Inspect and verify
+
+```bash
+# Discover the ID on the loaded first tape and read its embedded metadata.
+./tape-backup inspect --device /dev/nst0
+
+# Read and verify every data chunk and the whole archive's checksum.
+./tape-backup verify --backup BACKUP_ID --device /dev/nst0
+```
+
+Both commands may request subsequent volumes. `inspect` skips file data and is
+not a media-integrity check; its JSON output says `data_verified: false`. `verify`
+reads all data without extracting files and reports `data_verified: true` only
+when it reaches and validates the completion marker.
+
+## Existing v0.1 backups
+
+The streaming format and CLI replace v0.1's disk-staged design. Start a new full
+backup when migrating; a v0.1 snapshot cannot serve as a streaming incremental
+base. Previously completed v0.1 sets remain restorable with their original
+catalogs and the compatibility command:
+
+```bash
+./tape-backup legacy-restore --catalog full.json delta.json \
+  --destination /srv/old-backup --work-dir /srv/legacy-work --device /dev/nst0
+```
+
+This compatibility path retains v0.1's archive staging and disk-space requirements.
+Keep old catalogs for old tapes. Unfinished v0.1 staging is not converted into a
+streaming backup. Stop the old process before starting the new executable.
+
+## Automated tape loading
+
+`--media-command /absolute/path/to/loader` runs an executable with four arguments:
+
+```text
+write|read  BACKUP_ID  VOLUME_NUMBER  DEVICE
+```
+
+The loader must load the requested cartridge, wait for readiness, and return zero.
+For `write`, that cartridge must be safe to overwrite. For ID discovery, the ID
+argument is `unknown-backup`. The command runs without a shell; prompts otherwise
+use `/dev/tty`. Completed volumes are unloaded before subsequent media requests.
+
+## File-backed testing and building
+
+`--media-dir` uses files as simulated cartridges instead of a physical device.
+It cannot be combined with `--device`. Its default volume cap is 1 GiB.
+
+```bash
+full_id=$(./tape-backup backup --source ./sample-data --media-dir ./demo-tapes \
+  --volume-size 1MiB --buffer-size 256KiB)
+./tape-backup restore --backup "$full_id" --media-dir ./demo-tapes \
+  --destination ./demo-restored
+
+# Build a glibc 2.31 executable using Docker with BuildKit.
 ./build.sh
-./dist/tape-backup --help
 
-# Optional installation; only this executable needs to be copied.
-sudo install -m 755 dist/tape-backup /usr/local/bin/tape-backup
-```
-
-The output is `dist/tape-backup`, with a SHA-256 checksum in
-`dist/tape-backup.sha256`. Verify it from the `dist` directory with
-`sha256sum --check tape-backup.sha256`. Build output is ignored by Git.
-
-Replace `python3 tape_backup.py` in the examples below with `tape-backup` (or
-`./dist/tape-backup`). All commands and options, including `--device`, are the same:
-
-```bash
-./dist/tape-backup backup --source /srv/data --state /var/lib/tape-backup \
-  --level full --device /dev/nst0
-```
-
-Python and the Python modules are bundled with PyInstaller. **GNU tar and `mt`
-remain system dependencies**; on Debian/Ubuntu install `tar mt-st`. Normal Linux
-runtime libraries, including glibc and zlib, are also required. Docker and Python
-are not needed on the destination machine.
-
-The Docker build uses Debian 11 as a glibc 2.31 baseline and builds for the build
-machine's CPU architecture. The binary produced here is Linux x86-64. It targets
-glibc 2.31 or newer; Alpine/musl systems require a separate build. PyInstaller's
-single executable unpacks its runtime into a temporary directory when launched;
-that filesystem must support executable mappings and symlinks. Set `TMPDIR` to a
-suitable directory if the default temporary filesystem is mounted `noexec`.
-See [PyInstaller's Linux deployment notes](https://pyinstaller.org/en/stable/usage.html#gnu-linux)
-for the underlying compatibility constraints.
-
-For a native build without Docker:
-
-```bash
-# Requires Python 3.11+, its venv module, pip 22.3+, and binutils.
+# Or build for the local Linux environment with Python 3.11+, pip 22.3+,
+# the venv module, and binutils. The result inherits host library requirements.
 ./build.sh --local
-```
 
-This installs pinned PyInstaller in `.venv-build` without changing system Python
-packages. `PYTHON=/path/to/python3 ./build.sh --local` selects the build interpreter.
-A native build inherits that machine's runtime-library requirements, so build on
-the oldest distribution you intend to support. It replaces `dist/tape-backup`.
-
-Test the executable as well as the source:
-
-```bash
+# Test source code, legacy compatibility, and the built executable.
 TAPE_BACKUP_BINARY="$PWD/dist/tape-backup" python3 -m unittest discover -s tests -v
 
-# Exercise full + incremental restore in Debian 11 without Python installed.
+# Test in Debian 11 without Python installed.
 docker run --rm --network none \
   -v "$PWD/dist:/opt/tape-backup:ro" \
   -v "$PWD/tests/binary_smoke.sh:/smoke.sh:ro" \
   debian:bullseye-slim sh /smoke.sh
 ```
 
-## Full and incremental backups
+Build output is `dist/tape-backup` and `dist/tape-backup.sha256`; only the executable
+needs to be copied to another compatible system. `PYTHON=/path/to/python3` selects
+the interpreter for `--local` builds. PyInstaller is isolated in `.venv-build`.
 
-```bash
-# Full backup; /dev/nst0 is the default.
-python3 tape_backup.py backup \
-  --source /srv/data --state /var/lib/tape-backup --level full
+Tests cover streaming full and multiple incremental restores, no disk staging,
+metadata, ETA/rates, end-of-medium rollover, short writes, synchronous flush
+failures, lost buffered tails, duplicate replay, corruption, incomplete tapes,
+chain validation, and legacy compatibility. Physical tape hardware has not been
+exercised: qualify your drive and loader with scratch media before relying on it.
 
-# A subsequent delta, using a different drive.
-python3 tape_backup.py backup \
-  --source /srv/data --state /var/lib/tape-backup \
-  --level incremental --device /dev/nst1
+The format uses 64 KiB records with checksummed headers; each volume header and
+each chunk is a separate tape file. Archive payloads are GNU incremental tar
+streams; the surrounding version-2 framing is specific to this tool. Use this
+script to restore these volumes, rather than invoking tar directly on the device.
 
-# Inspect the completed baseline and any unfinished backup.
-python3 tape_backup.py status --state /var/lib/tape-backup
-```
-
-An incremental contains files changed since the last **completed** backup in that
-state directory, along with directory metadata needed to reproduce deletions and
-renames. Every intermediate delta is required to restore the latest state. A new
-full backup starts an independent chain. Use a separate state directory for each
-source/backup series.
-
-Successful backup commands print the absolute path of their `catalog.json` to
-stdout; progress goes to stderr. Save these paths for restore. The catalog and
-tape labels include a generated backup ID and a volume number.
-
-At each media prompt, load the requested writable cartridge and press Enter.
-**Writing rewinds and overwrites the loaded cartridge.** Each volume uses one
-cartridge; a new backup starts on a fresh cartridge, rather than appending after a
-previous backup. Verified cartridges are unloaded automatically. Label and retain
-every committed cartridge with its backup ID and volume number.
-
-By default, physical tapes are filled until the drive reports end of medium.
-`--volume-size 100GiB` can impose a smaller payload limit per cartridge; actual
-end-of-medium detection still applies. This limit excludes the 64 KiB header and
-final record padding. Size suffixes are `KiB`, `MiB`, `GiB`, and `TiB`.
-
-## Failure recovery
-
-```bash
-python3 tape_backup.py resume \
-  --state /var/lib/tape-backup --device /dev/nst0
-```
-
-On end of tape, the script closes the tape, rewinds it, and verifies its readable
-prefix against the staged archive. Only verified bytes are checkpointed. A lost
-buffered tail or a short write is replayed on the next cartridge. Verification
-doubles media I/O and adds a rewind per volume.
-
-Other I/O errors stop the command with a nonzero exit status. Fix the problem and
-run `resume`. Previously committed volumes are retained; the unfinished volume
-is rewritten from its beginning on the requested writable cartridge. A crash
-after verification but before the checkpoint may therefore require rewriting
-that volume too. Never load a cartridge containing an earlier committed volume
-for this write prompt.
-
-If staging was interrupted, `resume` regenerates the archive from the previous
-committed snapshot. Once staging completes, resume uses the same staged bytes,
-even if the source has subsequently changed or is no longer mounted. New source
-changes are picked up by the next incremental backup. A corrupt staged archive
-or snapshot is rejected rather than silently skipped.
-
-The incremental snapshot becomes the new baseline only after all volumes have
-been verified and the completion checkpoint has been saved. State and media
-locks prevent concurrent operations in the same repository; a per-device lock
-also serializes physical-drive access by this script under the same Unix account.
-Do not run another tape utility or a job under a different account on that drive
-at the same time.
-
-## Restore
-
-Pass the full catalog first, followed by **every** incremental catalog through the
-desired recovery point, in order. A full-only restore needs just its own catalog.
-
-```bash
-python3 tape_backup.py restore \
-  --catalog /safe/catalogs/full.json /safe/catalogs/delta-1.json /safe/catalogs/delta-2.json \
-  --destination /srv/recovered \
-  --work-dir /srv/restore-work \
-  --device /dev/nst0
-```
-
-The destination must be absent or empty. The work directory must initially be
-empty and must be separate from, and on the same filesystem as, the destination.
-Budget space for all reassembled tar archives plus the extracted directory tree.
-Restore requires the catalogs and tapes; the original source and `.snar`
-snapshots are not needed.
-
-The script checks chain continuity, volume identities, SHA-256 checksums, and
-archive sizes before extracting. It applies the full archive and then the
-incrementals in a private directory, reproducing additions, modifications,
-deletions, and renames. When extraction succeeds, it publishes that directory
-with an atomic rename. GNU tar preserves permissions, timestamps, links, sparse
-files, ACLs, and extended attributes where the filesystem and user permissions
-allow. Restoring arbitrary owners and privileged metadata generally requires root.
-
-After an interrupted restore, repeat the **same command** with the same work
-directory. Cached volume data is revalidated and reused. An interrupted extraction
-is restarted from the full archive in the private directory. Existing destination
-files are never merged with a restore. Use trusted catalogs and archives, especially
-when restoring as root.
-
-## Keep the catalogs and state
-
-State is stored as:
-
-```text
-state/
-  index.json                       # Committed baseline and unfinished backup ID
-  backups/<backup-id>/
-    catalog.json                   # Archive identity, chain, volume hashes/offsets
-    snapshot.snar                  # GNU tar incremental snapshot
-    archive.tar                    # Staged GNU tar archive
-```
-
-**Store copies of completed catalogs somewhere independent of the source and
-backup machine. They are required to restore these tape sets.** Protect the state
-directory as well: its committed snapshot is required to create the next delta.
-Catalogs describe checksums but are not cryptographically signed.
-
-Staged archives are retained deliberately for recovery and inspection. After a
-backup is complete and `status` shows no pending job, its `archive.tar` can be
-removed to reclaim space. Keep its catalog and snapshot. Never remove or modify
-files belonging to a pending backup. Restore work directories can be removed
-after successful restoration.
-
-The on-media format is a 64 KiB identifying header followed by 64 KiB records
-containing a segment of a GNU tar archive, with zero padding in the last record.
-Catalogs record the exact payload length of each verified volume. This is a
-versioned tape container, **not GNU tar's native `--multi-volume` format**; use
-this script to reassemble tapes. The staged and reassembled `.tar` files are
-ordinary GNU incremental tar archives. For example, inspect one with:
-
-```bash
-tar --list --incremental --verbose --file archive.tar
-```
-
-## Automated loading
-
-Use `--media-command /absolute/path/to/loader` for unattended operation. The
-executable receives four arguments:
-
-```text
-write|read  BACKUP_ID  VOLUME_NUMBER  DEVICE
-```
-
-It must load the requested cartridge, wait until the drive is ready, and return
-zero on success. On `write`, that cartridge must be safe to overwrite. The script
-then rewinds it and sets variable block mode. The hook runs directly without a
-shell, once per requested volume; read-back verification keeps the same cartridge
-loaded and does not call the hook again. A failing loader leaves the operation
-resumable. Without a hook, prompts use `/dev/tty`; a noninteractive process fails
-with instructions to supply a loader.
-
-## File-backed demonstration and tests
-
-`--media-dir` replaces physical cartridges with files using the same record format.
-It is mutually exclusive with `--device`. Its default volume payload is 1 GiB.
-
-```bash
-python3 tape_backup.py backup \
-  --source ./sample-data --state ./demo-state \
-  --media-dir ./demo-tapes --volume-size 128KiB
-
-# Use the catalog path printed by the backup command.
-python3 tape_backup.py restore \
-  --catalog ./demo-state/backups/BACKUP_ID/catalog.json \
-  --destination ./demo-restored --work-dir ./demo-restore-work \
-  --media-dir ./demo-tapes
-
-python3 -m unittest discover -s tests -v
-```
-
-Tests run real GNU tar backup/restore cycles and inject ENOSPC, short writes,
-delayed close failures, lost buffered data, corrupt/truncated/wrong volumes,
-checkpoint failures, and interrupted extraction. They check multiple deltas,
-deletions, renames, unchanged-file omission, sparse files, extended attributes,
-links, permissions, drive selection, and resume without the source. Physical tape
-hardware has not been exercised by these tests; qualify your drive and loader
-with a scratch-media backup and restore before relying on them.
-
-The implementation follows [GNU tar's incremental backup semantics](https://www.gnu.org/software/tar/manual/html_node/Incremental-Dumps.html)
-and the Linux [SCSI tape driver's record, close, and end-of-medium behavior](https://www.kernel.org/doc/html/latest/scsi/st.html).
+See [GNU tar incremental semantics](https://www.gnu.org/software/tar/manual/html_node/Incremental-Dumps.html)
+and the [Linux SCSI tape driver](https://www.kernel.org/doc/html/latest/scsi/st.html)
+for the underlying archive and tape behavior.

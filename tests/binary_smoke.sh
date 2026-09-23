@@ -13,17 +13,17 @@ dd if=/dev/zero of="$work_dir/source/keep" bs=1024 count=200 2>/dev/null
 printf 'before\n' > "$work_dir/source/change"
 printf 'remove\n' > "$work_dir/source/remove"
 
-full_catalog="$("$binary" backup --source "$work_dir/source" \
-    --state "$work_dir/state" --media-dir "$work_dir/media" --volume-size 64KiB)"
+full_id="$("$binary" backup --source "$work_dir/source" \
+    --media-dir "$work_dir/media" --volume-size 256KiB --buffer-size 64KiB)"
 printf 'after\n' > "$work_dir/source/change"
 printf 'added\n' > "$work_dir/source/added"
 rm "$work_dir/source/remove"
-delta_catalog="$("$binary" backup --source "$work_dir/source" \
-    --state "$work_dir/state" --media-dir "$work_dir/media" --volume-size 64KiB \
-    --level incremental)"
-"$binary" restore --catalog "$full_catalog" "$delta_catalog" \
-    --destination "$work_dir/restored" --work-dir "$work_dir/restore-work" \
+delta_id="$("$binary" backup --source "$work_dir/source" \
+    --media-dir "$work_dir/media" --volume-size 256KiB --buffer-size 64KiB \
+    --level incremental --base "$full_id")"
+"$binary" restore --backup "$full_id" "$delta_id" \
+    --destination "$work_dir/restored" \
     --media-dir "$work_dir/media"
 diff -r "$work_dir/source" "$work_dir/restored"
-"$binary" status --state "$work_dir/state" >/dev/null
-printf 'Standalone full + incremental restore passed without Python installed.\n'
+"$binary" verify --backup "$delta_id" --media-dir "$work_dir/media" >/dev/null
+printf 'Streaming full + incremental restore passed without Python or disk archive staging.\n'

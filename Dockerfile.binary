@@ -6,7 +6,7 @@ RUN apt-get update \
 WORKDIR /build
 COPY requirements-build.txt ./
 RUN python -m pip install --no-cache-dir -r requirements-build.txt
-COPY tape_backup.py ./
+COPY tape_backup.py legacy_v1.py ./
 RUN python -m PyInstaller --noconfirm --clean --onefile --noupx \
     --name tape-backup tape_backup.py
 
