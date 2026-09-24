@@ -36,7 +36,7 @@ POSITION_INTERVAL = 16 * 1024**2
 MAGIC = b"TAPE-STREAM-3\n"
 ZFS_MAGIC = b"TAPE-STREAM-4\n"
 ZERO_CHAIN = "0" * 64
-PROGRAM_VERSION = "2.1.0"
+PROGRAM_VERSION = "2.1.1"
 # Linux struct mtop: short operation, padding, int count (x86-64 / AArch64).
 MTIOCTOP = 0x40086D01
 MTWEOF = 5
@@ -44,6 +44,7 @@ MTFSF, MTREW, MTBSFM, MTEOM, MTSEEK = 1, 6, 10, 12, 22
 MTERASE = 13
 MTCOMPRESSION = 32
 MAX_CATALOG_BYTES = 64 * 1024**2
+MAX_ANCESTORS = 512
 RECOVERABLE = (errno.ENOSPC, errno.EIO)
 SSH_MAGIC = b"TAPE-SSH-3\n"
 # Current SSH transport uses a 64-bit payload length.
@@ -181,6 +182,35 @@ def valid_id(value):
     if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value):
         raise BackupError("Invalid backup ID; use the ID printed on the tape label")
     return value
+
+
+def backup_ancestry(job):
+    """Return known ancestors (nearest first) and whether the list is complete."""
+    parent = job.get('parent')
+    if 'ancestors' not in job and 'ancestry_complete' not in job:
+        return ([valid_id(parent)], False) if parent is not None else ([], job.get('level') == 'full')
+    ancestors, complete = job.get('ancestors'), job.get('ancestry_complete')
+    if not isinstance(ancestors, list) or len(ancestors) > MAX_ANCESTORS or type(complete) is not bool:
+        raise BackupError('Invalid backup ancestry metadata')
+    for ancestor in ancestors:
+        valid_id(ancestor)
+    if len(set(ancestors)) != len(ancestors) or job.get('id') in ancestors:
+        raise BackupError('Duplicate or cyclic backup ancestry')
+    if parent is None:
+        if ancestors or not complete or job.get('level') != 'full':
+            raise BackupError('Full backup ancestry must be empty and complete')
+    elif not ancestors or ancestors[0] != parent or job.get('level') != 'incremental':
+        raise BackupError('Backup ancestry does not match its immediate parent')
+    return ancestors, complete
+
+
+def child_ancestry(parent):
+    if parent is None:
+        return {'ancestors': [], 'ancestry_complete': True}
+    ancestors, complete = backup_ancestry(parent)
+    ancestors = [valid_id(parent['id']), *ancestors]
+    return {'ancestors': ancestors[:MAX_ANCESTORS],
+            'ancestry_complete': complete and len(ancestors) <= MAX_ANCESTORS}
 
 
 @contextmanager
@@ -880,6 +910,7 @@ def read_metadata(volume, record, snapshot_fd=None):
             raise ValueError('invalid metadata lengths')
         summary = head['summary']
         valid_id(summary['id'])
+        backup_ancestry(summary)
         if snapshot_size != summary['snapshot_bytes']:
             raise ValueError('snapshot length differs from completion record')
         catalog, digest = read_payload(volume, catalog_size)
@@ -1071,6 +1102,14 @@ def select_volume(volume, backup_id, number):
                         volume.catalog_entries = entries[:index + 1]
                         volume.record_bytes = entry['record_bytes'] + BLOCK_SIZE
                         return True
+            if (not any(entry['id'] == backup_id and entry['volume'] == number for entry in entries)
+                    and entries[0]['position'] == 0 and entries[0]['record_bytes'] == 0
+                    and all(a['position'] < b['position'] and a['record_bytes'] < b['record_bytes']
+                            for a, b in zip(entries, entries[1:]))):
+                # A complete, current cartridge catalog can rule out this ID.
+                # Bind its endpoints to actual headers before trusting absence.
+                validate_metadata_locations(volume, cached)
+                return False
     volume.seek_position(start)
     volume.record_bytes = initial_bytes
     return locate_volume(volume, backup_id, number)
@@ -1219,15 +1258,23 @@ class TapeMedia:
                 with OUTPUT_LOCK, open("/dev/tty", "r") as tty_in, open("/dev/tty", "w") as tty_out:
                     purpose = ('continuation' if number > 1 else 'write') if action == 'blank' else action
                     while True:
-                        choices = 'wipe to short-erase the loaded tape, or ' if action == 'blank' else ''
+                        choices = 'wipe to short-erase the loaded tape, ' if action == 'blank' else ''
                         tty_out.write(f"Load {label} into {self.device} for {purpose}{warning}.\n"
-                                      f"Press Enter when ready, or type {choices}q to stop: ")
+                                      f"Press Enter when ready, or type {choices}eject to unload, or q to stop: ")
                         tty_out.flush()
                         response = tty_in.readline()
                         if not response or response.strip().lower() == 'q':
                             raise BackupError('Media change cancelled; the streaming operation is incomplete')
                         if not response.strip():
                             return
+                        if response.strip().lower() == 'eject':
+                            try:
+                                self.eject()
+                                tty_out.write('Tape ejected; insert the requested cartridge, then press Enter.\n')
+                            except (BackupError, OSError) as exc:
+                                tty_out.write(f'Eject failed: {display_text(exc)}. '
+                                              'Operation remains active; replace the cartridge or retry.\n')
+                            continue
                         if action == 'blank' and response.strip().lower() == 'wipe':
                             try:
                                 if self.wipe_at_prompt(backup_id, tty_in, tty_out):
@@ -1272,6 +1319,9 @@ class TapeMedia:
                 if hashlib.sha256(record).hexdigest() in getattr(self, 'protected_headers', set()):
                     raise BackupError('This cartridge is already part of the active backup or its '
                                       'append base; it cannot be wiped here')
+                if not getattr(self, 'protected_ancestry_complete', True):
+                    raise BackupError('The complete ancestor chain is unknown; refusing to erase recorded '
+                                      'media that could contain a required backup. Load a blank cartridge')
                 if record.startswith((MAGIC, ZFS_MAGIC)):
                     header = decoded_header(record)
                     if header.get('type') != 'volume' or not isinstance(header.get('backup'), dict):
@@ -1280,7 +1330,7 @@ class TapeMedia:
                     if type(header.get('volume')) is not int or header['volume'] < 1:
                         raise BackupError('Invalid volume number in cartridge header')
                     if identifier in getattr(self, 'protected_backup_ids', {backup_id}):
-                        raise BackupError('This cartridge contains a volume of the active backup or its base; '
+                        raise BackupError('This cartridge contains a volume of the active backup or its base/ancestors; '
                                           'it cannot be wiped here')
                     tty_out.write(f"Loaded tape starts with backup {identifier}, volume {header['volume']}.\n")
             tty_out.write(f'DESTROY ALL recorded backups on the loaded tape in {self.device} '
@@ -1399,7 +1449,9 @@ class TapeMedia:
         return None
 
     def eject(self):
+        self.mt('unlock')
         self.mt("offline")
+        self.loaded = False
 
     def compression(self, action='status'):
         if action not in ('status', 'on', 'off'):
@@ -1474,7 +1526,9 @@ class StreamWriter:
     def __init__(self, media, job, volume_size, progress, buffer_size=DEFAULT_BUFFER):
         self.media, self.job = media, job
         self.media.protected_headers = set()
-        self.media.protected_backup_ids = {job['id'], job.get('parent')} - {None}
+        ancestors, complete = backup_ancestry(job)
+        self.media.protected_backup_ids = {job['id'], *ancestors}
+        self.media.protected_ancestry_complete = complete
         self.volume_size, self.progress = volume_size, progress
         self.replay_limit = max(2 * BLOCK_SIZE, buffer_size)
         if volume_size:
@@ -1755,6 +1809,7 @@ class StreamReader:
                 raise ValueError("full backup has a parent")
             if job["level"] == "incremental":
                 valid_id(job["parent"])
+            backup_ancestry(job)
             if job.get('archive_type') == 'zfs':
                 metadata = validate_zfs_metadata(job.get('zfs'))
                 if (job['source'] != metadata['dataset'] or
@@ -2021,13 +2076,17 @@ def inspect_backup(media, backup_id=None):
 
 def scan(media, backup_id=None, snapshot_fd=None, *, verify=True, progress=None):
     own_progress = progress is None
-    context = Progress("Reading tape metadata" if not verify else "Verifying backup") if own_progress else nullcontext(progress)
+    context = (Progress("Reading tape metadata" if not verify else "Verifying backup",
+                        archives=1 if verify else None) if own_progress else nullcontext(progress))
     with context as progress:
+        if own_progress and verify:
+            progress.track_archive(None, stage='verification')
         reader = StreamReader(media, backup_id, progress)
         try:
             reader.next_volume()
             progress.phase = "reading tapes"
-            progress.estimate(reader.job.get('estimated_bytes'))
+            if progress.overall is None or not progress.overall['sizes']:
+                progress.estimate(reader.job.get('estimated_bytes'))
             for kind, payload in reader.frames(skip_data=not verify):
                 if payload is not None:
                     progress.read_bytes += len(payload)
@@ -2037,6 +2096,7 @@ def scan(media, backup_id=None, snapshot_fd=None, *, verify=True, progress=None)
                     with os.fdopen(os.dup(snapshot_fd), "ab", buffering=0) as snapshot:
                         snapshot.write(payload)
             if own_progress:
+                progress.finish_archive()
                 progress.phase = "complete"
             return reader.summary
         finally:
@@ -2355,7 +2415,7 @@ def zfs_frames(metadata, buffer_size, process=None, progress=None):
 
 
 def backup_zfs(snapshot, media, *, base=None, raw=None, volume_size=None,
-               buffer_size=DEFAULT_BUFFER, quiet=False, ssh=None):
+               buffer_size=DEFAULT_BUFFER, quiet=False, ssh=None, verify=False):
     zfs_name(snapshot, snapshot=True)
     if not BLOCK_SIZE <= buffer_size <= MAX_BUFFER:
         raise BackupError('Buffer size must be between 64KiB and 10GiB')
@@ -2382,7 +2442,7 @@ def backup_zfs(snapshot, media, *, base=None, raw=None, volume_size=None,
                 raise BackupError('ZFS source differs from parent backup')
             return write_backup(metadata['source'], media, 'incremental' if base else 'full', base,
                                 volume_size, buffer_size, quiet, snapshot_fd, metadata['estimated_bytes'],
-                                remote, frame_size, zfs=metadata['zfs'])
+                                remote, frame_size, zfs=metadata['zfs'], parent_job=parent, verify=verify)
         finally:
             if remote:
                 remote.close()
@@ -2811,7 +2871,7 @@ def serve_ssh_source():
 
 
 def backup(source, media, *, level="full", base=None, volume_size=None,
-           buffer_size=DEFAULT_BUFFER, quiet=False, ssh=None, append=False, excludes=None):
+           buffer_size=DEFAULT_BUFFER, quiet=False, ssh=None, append=False, excludes=None, verify=False):
     source = Path(source) if ssh else Path(source).resolve()
     if ssh and not source.is_absolute():
         raise BackupError("SSH --source must be an absolute path on the remote machine")
@@ -2868,16 +2928,19 @@ def backup(source, media, *, level="full", base=None, volume_size=None,
             if parent and parent["source"] != str(source):
                 raise BackupError("Incremental source differs from the parent backup")
             return write_backup(source, media, level, base, volume_size, buffer_size, quiet,
-                                snapshot_fd, estimated_bytes, remote, frame_size, excludes=excludes)
+                                snapshot_fd, estimated_bytes, remote, frame_size, excludes=excludes,
+                                parent_job=parent, verify=verify)
         finally:
             if remote:
                 remote.close()
 
 
 def write_backup(source, media, level, base, volume_size, buffer_size, quiet,
-                 snapshot_fd, estimated_bytes, remote, frame_size, *, excludes=None, zfs=None):
+                 snapshot_fd, estimated_bytes, remote, frame_size, *, excludes=None, zfs=None,
+                 parent_job=None, verify=False):
     job = {"id": uuid.uuid4().hex, "level": level, "parent": base, "source": str(source),
-           "created": datetime.now(timezone.utc).isoformat(), "estimated_bytes": estimated_bytes}
+           "created": datetime.now(timezone.utc).isoformat(), "estimated_bytes": estimated_bytes,
+           **child_ancestry(parent_job)}
     if remote:
         job["ssh"] = remote.config.metadata
     if excludes:
@@ -2889,7 +2952,8 @@ def write_backup(source, media, level, base, volume_size, buffer_size, quiet,
         f"buffer {buffer_size / 1024**2:g} MiB; continuous writes, "
         f"{frame_size / 1024**2:g} MiB frames, background reader; "
         "no disk archive or state directory")
-    with Progress(job["id"], buffer_size=buffer_size, archives=1) as progress, ram_snapshot() as metadata_snapshot:
+    with Progress(job["id"], buffer_size=buffer_size, archives=1, passes=2 if verify else 1) as progress, \
+            ram_snapshot() as metadata_snapshot:
         progress.track_archive(estimated_bytes)
         writer = StreamWriter(media, job, volume_size, progress, buffer_size)
         process = None
@@ -2944,8 +3008,23 @@ def write_backup(source, media, level, base, volume_size, buffer_size, quiet,
             media.last_result = {**job, **end, 'volumes': writer.number, 'archive_complete': True,
                                  'metadata_complete': metadata_complete, 'append_ready': append_ready,
                                  'data_verified': False, 'warnings': warnings}
+            if verify:
+                log(f"Committed {job['id']}; starting read-back verification")
+                # The source and catalog have finished using both RAM snapshots.
+                # Keep the drive lock, but do not retain their pages during read-back.
+                os.ftruncate(snapshot_fd, 0)
+                os.ftruncate(metadata_snapshot, 0)
+                progress.buffer_size = progress.reader_state = None
+                progress.track_archive(end['data_bytes'], pass_number=1,
+                                       stage='verification', sizes=[end['data_bytes']])
+                try:
+                    scan(media, job['id'], progress=progress)
+                except (BackupError, OSError) as exc:
+                    raise BackupError(f"Backup {job['id']} was committed, but read-back verification failed: {exc}") from exc
+                media.last_result['data_verified'] = True
+                progress.finish_archive()
             progress.phase = "complete"
-            log(f"Completed {job['id']}: {progress.read_bytes} archive bytes, {writer.number} volume(s)")
+            log(f"Completed {job['id']}: {end['data_bytes']} archive bytes, {writer.number} volume(s)")
             return job["id"]
         finally:
             try:
@@ -3324,6 +3403,7 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     os.umask(0o077)
     args = None
+    media = None
     try:
         if argv == ["_ssh-source"]:
             serve_ssh_source()
@@ -3378,11 +3458,11 @@ def main(argv=None):
             size = args.volume_size or (1024**3 if args.media_dir else None)
             result = backup(args.source, media, level=args.level, base=args.base,
                             volume_size=size, buffer_size=args.buffer_size, quiet=args.quiet, ssh=ssh,
-                            append=args.append, excludes=excludes)
+                            append=args.append, excludes=excludes, verify=args.verify)
         elif args.command == 'zfs-backup':
             result = backup_zfs(args.snapshot, media, base=args.base, raw=args.raw,
                                 volume_size=args.volume_size or (1024**3 if args.media_dir else None),
-                                buffer_size=args.buffer_size, quiet=args.quiet, ssh=ssh)
+                                buffer_size=args.buffer_size, quiet=args.quiet, ssh=ssh, verify=args.verify)
         elif args.command == 'zfs-restore':
             result = restore_zfs(args.backup, args.dataset, media)
         elif args.command == "restore":
@@ -3407,13 +3487,6 @@ def main(argv=None):
                     result = scan(media, args.backup)
             result = information_output(result, format_backup_info, args.output_format)
         if args.command in ('backup', 'zfs-backup'):
-            if args.verify:
-                try:
-                    with media.lock():
-                        scan(media, result)
-                except (BackupError, OSError) as exc:
-                    raise BackupError(f'Backup {result} was committed, but read-back verification failed: {exc}') from exc
-                media.last_result['data_verified'] = True
             if args.json:
                 result = json.dumps(media.last_result, indent=2)
         print(result)
@@ -3434,6 +3507,10 @@ def main(argv=None):
             log('File listing interrupted; output may be incomplete.')
         elif args is not None and args.command in ('inspect', 'verify'):
             log(f'{args.command.capitalize()} interrupted; the operation did not complete.')
+        elif (args is not None and args.command in ('backup', 'zfs-backup') and args.verify and
+              getattr(media, 'last_result', {}).get('archive_complete')):
+            log(f"Backup {media.last_result['id']} was committed; read-back verification interrupted. "
+                'Run verify for this backup to check it.')
         else:
             log("Interrupted. Preserve existing tapes; an incomplete tail cannot be appended to. "
                 "Start a new full backup on separate media, or repeat restore from the first tape.")

@@ -169,6 +169,56 @@ class RestoreProgressTests(unittest.TestCase):
         self.assertNotIn('100.0%', self.output.getvalue())
         self.assertFalse((self.root / 'restored').exists())
 
+    def test_backup_verification_is_one_progress_operation_and_retains_media_lock(self):
+        (self.source / 'book').write_bytes(os.urandom(700000))
+        original_scan = tb.scan
+        def verify(media, backup_id, **kwargs):
+            self.assertNotIn('100.0%', self.output.getvalue())
+            progress = kwargs['progress']
+            self.assertIn('50.0%', progress.total_progress())
+            self.assertEqual(progress.total_bytes, media.last_result['data_bytes'])
+            with self.assertRaises(tb.BackupError), media.lock():
+                pass
+            return original_scan(media, backup_id, **kwargs)
+        with patch.object(tb, 'scan', verify):
+            backup_id = tb.backup(self.source, self.media, buffer_size=128 * 1024,
+                                  volume_size=512 * 1024, quiet=True, verify=True)
+        self.assertTrue(self.media.last_result['data_verified'])
+        self.assertEqual(self.output.getvalue().count('100.0% (complete)'), 1)
+        self.assertIn(f"Completed {backup_id}: {self.media.last_result['data_bytes']} archive bytes",
+                      self.output.getvalue())
+        self.assertEqual([state['stage'] for _, state, _ in self.states], ['backup', 'verification'])
+
+    def test_failed_backup_verification_never_displays_complete_and_preserves_commit_result(self):
+        (self.source / 'book').write_text('content')
+        with patch.object(tb, 'scan', side_effect=tb.BackupError('Checksum failure')), \
+                self.assertRaisesRegex(tb.BackupError, 'was committed, but read-back verification failed'):
+            tb.backup(self.source, self.media, quiet=True, verify=True)
+        self.assertTrue(self.media.last_result['archive_complete'])
+        self.assertFalse(self.media.last_result['data_verified'])
+        self.assertNotIn('100.0%', self.output.getvalue())
+
+    def test_real_standalone_verify_reports_payload_percentage_and_eta_without_delivery(self):
+        (self.source / 'book').write_bytes(os.urandom(700000))
+        full, size = self.backup()
+        self.output.seek(0)
+        self.output.truncate()
+        advance, samples = tb.Progress.advance, []
+        def report(progress, count):
+            advance(progress, count)
+            progress.eta_started = tb.time.monotonic() - 10
+            progress.report()
+            samples.append(progress.overall['done'])
+            self.assertEqual(progress.written_bytes, 0)
+        with patch.object(tb.Progress, 'advance', report):
+            result = tb.scan(self.media, full)
+        self.assertTrue(result['data_verified'])
+        self.assertEqual(samples[-1], size)
+        self.assertGreater(len(samples), 1)
+        self.assertIn('ETA ~', self.output.getvalue())
+        self.assertIn('(verification, estimated)', self.output.getvalue())
+        self.assertIn('100.0% (complete)', self.output.getvalue())
+
 
 if __name__ == '__main__':
     unittest.main()

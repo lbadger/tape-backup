@@ -56,6 +56,8 @@ class ZFSStreamTests(unittest.TestCase):
             self.assertGreater(info['volumes'], 1)
             self.assertEqual(info['zfs'], expected)
             self.assertEqual(info['archive_type'], 'zfs')
+            self.assertEqual(info['ancestors'], [full] if backup_id == delta else [])
+            self.assertTrue(info['ancestry_complete'])
         first_tape = self.media.directory / f'{full}.0001.tape'
         self.assertTrue(first_tape.read_bytes().startswith(tb.ZFS_MAGIC))
 

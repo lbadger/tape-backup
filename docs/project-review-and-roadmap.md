@@ -55,6 +55,11 @@ preserve those while making operation and recovery easier to understand.
 
 ## Evidence and current strengths
 
+**v2.1.1** closes the older-ancestor wipe gap with persistent bounded ancestry and
+conservative handling of incomplete older chains. It avoids payload scans for
+catalog-confirmed negative lookups, fixes standalone/read-back progress, and
+allows explicit eject under the active job's drive lock at media prompts.
+
 **v2.1.0** adds confirmed short erase inside the active backup's blank-cartridge
 prompt and overall backup/restore progress. Regressions cover preserving RAM
 continuation state, protecting earlier volumes and append bases, handling erase

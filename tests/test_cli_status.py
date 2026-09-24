@@ -50,6 +50,21 @@ class CLIStatusTests(unittest.TestCase):
         self.assertTrue(result['data_verified'])
         self.assertEqual(result['warnings'], [])
 
+    def test_failed_or_interrupted_readback_reports_committed_backup_without_success(self):
+        source = self.root / 'verify-source'
+        source.mkdir()
+        (source / 'book').write_text('content')
+        for failure, code in ((tb.BackupError('Corrupt payload'), 1), (KeyboardInterrupt(), 130)):
+            output, errors = io.StringIO(), io.StringIO()
+            with self.subTest(code=code), patch.object(tb, 'scan', side_effect=failure), \
+                    redirect_stdout(output), redirect_stderr(errors):
+                self.assertEqual(tb.main(['backup', '--source', str(source), '--media-dir',
+                    str(self.root / f'media-{code}'), '--quiet', '--json', '--verify']), code)
+            self.assertEqual(output.getvalue(), '')
+            self.assertIn('was committed', errors.getvalue())
+            self.assertNotIn('100.0%', errors.getvalue())
+            self.assertNotIn('Start a new full backup', errors.getvalue())
+
     def test_metadata_failure_is_reported_without_mislabeling_the_committed_archive(self):
         with patch.object(tb, 'write_metadata', side_effect=OSError(errno.EIO, 'Injected footer failure')):
             code, result = self.backup()

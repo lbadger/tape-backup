@@ -614,7 +614,7 @@ class StreamingTests(unittest.TestCase):
                     prompt = os.read(master, 4096).decode()
                     action = 'write' if writing else 'read'
                     self.assertIn(f"Load {'a'*32} volume 2 into /dev/nst1 for {action}", prompt)
-                    self.assertIn('Press Enter when ready, or type q to stop:', prompt)
+                    self.assertIn('Press Enter when ready, or type eject to unload, or q to stop:', prompt)
                     self.assertEqual('CONTENTS WILL BE OVERWRITTEN' in prompt, writing)
                     if response == b'\n':
                         self.assertEqual([call.args for call in media.mt.call_args_list],
@@ -658,7 +658,8 @@ class EjectTests(unittest.TestCase):
                         patch.object(tb, 'run_command') as command, redirect_stdout(output):
                     self.assertEqual(tb.main(args), 0)
                 factory.assert_called_once_with(device)
-                command.assert_called_once_with(['mt', '-f', device, 'offline'])
+                self.assertEqual([c.args[0] for c in command.call_args_list],
+                                 [['mt', '-f', device, 'unlock'], ['mt', '-f', device, 'offline']])
                 self.assertEqual(output.getvalue().strip(), f'Ejected tape from {device}')
 
     def test_eject_refuses_a_drive_locked_by_another_job(self):

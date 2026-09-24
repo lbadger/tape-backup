@@ -59,7 +59,7 @@ class BinaryTests(unittest.TestCase):
         self.assertEqual(actual, expected)
 
     def test_relocated_binary_without_python_full_and_incremental_restore(self):
-        self.assertEqual(self.run_binary("--version"), "tape-backup 2.1.0")
+        self.assertEqual(self.run_binary("--version"), "tape-backup 2.1.1")
         self.assertIn("/dev/nst0", self.run_binary("backup", "--help"))
         self.assertNotIn('--volume-size', self.run_binary('backup', '--help'))
         full = self.run_binary(*self.backup_args)
@@ -115,6 +115,17 @@ class BinaryTests(unittest.TestCase):
         full = run(*self.backup_args, '--quiet')
         run('restore', '--backup', full, '--destination', self.root / 'restored',
             '--media-dir', self.media, '--quiet')
+
+    def test_binary_backup_verify_reaches_complete_only_after_readback(self):
+        result = json.loads(self.run_binary(*self.backup_args, '--quiet', '--json', '--verify'))
+        before, after = self.last_stderr.split('starting read-back verification', 1)
+        self.assertNotIn('100.0%', before)
+        self.assertEqual(after.count('Total 100.0% (complete)'), 1)
+        self.assertTrue(result['archive_complete'])
+        self.assertTrue(result['data_verified'])
+        verified = json.loads(self.run_binary('verify', '--backup', result['id'], '--media-dir', self.media))
+        self.assertEqual(verified['data_bytes'], result['data_bytes'])
+        self.assertIn('Total 100.0% (complete)', self.last_stderr)
 
     def test_binary_rejects_incomplete_backup_and_can_start_again(self):
         wrapper = self.tools / "tar"

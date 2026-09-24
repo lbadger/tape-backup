@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.1.1 — 2026-09-24
+
+- Carry a bounded ancestor list in new backup headers and catalog summaries.
+  Refuse prompted erasure of any known ancestor, including full backups on other
+  cartridges. If an older incremental has incomplete ancestry, refuse recorded
+  tape wipes at the prompt while keeping append and restore available.
+- Reject missing backup IDs/volumes through complete, current catalogs after
+  validating their endpoints; avoid traversing archive payload merely to reject
+  a wrong tape. Preserve fallback for absent or partial catalogs.
+- Include read-back in `backup --verify` and `zfs-backup --verify` total progress,
+  retain the drive lock across both passes, and reserve completion for successful
+  verification. Preserve the committed result if read-back fails or is interrupted.
+- Show standalone verification progress and ETA from unique archive payload
+  bytes. Release source snapshot RAM before post-backup verification.
+- Add explicit `eject` at manual media prompts. Unlock and unload without ending
+  the active operation; preserve the requested volume, buffers, and drive lock.
+  The standalone `eject` command also unlocks before unloading.
+
 ## 2.1.0 — 2026-09-24
 
 - Add `wipe` at interactive blank-cartridge prompts, followed by a separate

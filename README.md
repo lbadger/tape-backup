@@ -20,20 +20,21 @@ to select another non-rewinding tape drive.
 
 ## Current executable
 
-Version **2.1.0** adds short erase at a backup's cartridge-change prompt and total
-progress bars for backup and restore. It includes native ZFS streaming,
+Version **2.1.1** protects ancestor tapes during prompted wipes, adds `eject` at
+cartridge-change prompts, avoids archive scans for catalog-confirmed missing
+backups, and fixes verification progress. It includes native ZFS streaming,
 file/folder exclusions, shared restore locking, and readable drive diagnostics.
 Existing format-3 tar backups
 remain readable. Update both machines when using SSH; transport version 3 prevents
 older helpers from silently ignoring exclusion or ZFS options.
 
 Download the executable and checksum from the
-[v2.1.0 release](https://github.com/lbadger/tape-backup/releases/tag/v2.1.0), or
+[v2.1.1 release](https://github.com/lbadger/tape-backup/releases/tag/v2.1.1), or
 build from the current source checkout using Docker:
 
 ```bash
 ./build.sh
-./dist/tape-backup --version  # tape-backup 2.1.0
+./dist/tape-backup --version  # tape-backup 2.1.1
 (cd dist && sha256sum --check tape-backup.sha256)
 ```
 
@@ -490,6 +491,10 @@ be appended to; `append_ready: null` reports that uncertainty. Without `--json`,
 successful backups still print only their ID on stdout. `--verify` performs a
 full read-back after backup; only successful verification sets `data_verified`
 true. Verification failures return nonzero and identify the committed backup.
+With `--verify`, writing occupies the first half of total progress and read-back
+the second half, using the actual committed archive size. The drive lock is held
+through both passes. The display reaches 100% only after verification succeeds;
+failed or interrupted read-back does not undo the committed backup.
 
 File names are printed by default. Progress is printed every five seconds and
 at completion. Terminals show a block sized to the available width, for example:
@@ -527,6 +532,9 @@ application uses the exact verified archive sizes. Unknown sizes are shown as
 unknown. The display reserves **100% for successful completion**, including
 final flushing and restore history updates; reaching an estimate is not success.
 Progress stays silent during cartridge and wipe-confirmation prompts.
+Standalone `verify` also shows a total bar and calculates ETA from verified
+archive payload bytes. Its initial size comes from the archive header estimate;
+reading snapshot metadata or replayed frames does not advance payload progress.
 
 Backup status shows the configured buffer budget, queued payload bytes, recovery
 bytes retained (including framing), and archive bytes confirmed on media. Each of
@@ -733,8 +741,10 @@ and reports `data_verified: true` only after validating the full stream and
 completion record. Final archive sizes, checksums, and total volume counts come
 from `verify`.
 
-Selecting `--backup ID` can use the final catalog to seek to that backup's header;
-without a usable catalog it scans preceding records. Use `verify --backup ID`
+Selecting `--backup ID` can use the final catalog to seek to that backup's header.
+When a complete current catalog rules out the requested ID or volume, the reader
+rejects the cartridge without scanning archive payload. Without a usable complete
+catalog it can scan preceding records. Use `verify --backup ID`
 to validate the selected backup's full stream, rather than every backup on the
 cartridge. For a recovery chain, verify each backup separately.
 
@@ -818,7 +828,7 @@ repartition media or certify erasure of other partitions or cartridge memory.
 You can also initialize an unrelated used cartridge **while a backup is waiting**:
 
 ```text
-Press Enter when ready, or type wipe to short-erase the loaded tape, or q to stop: wipe
+Press Enter when ready, or type wipe to short-erase the loaded tape, eject to unload, or q to stop: wipe
 ...
 Type WIPE to confirm, or anything else to return to the tape prompt: WIPE
 Short erase in progress; backup buffers are retained...
@@ -832,8 +842,8 @@ the load prompt without ending the backup. Refused or failed erases also return
 to that prompt, preserving pending data. The next write still requires a
 successful blank check.
 
-The prompt refuses tapes whose first header identifies the active backup or its
-base, and remembers first-header fingerprints of cartridges already written or
+The prompt refuses tapes whose first header identifies the active backup or any
+recorded ancestor, and remembers first-header fingerprints of cartridges already written or
 selected for appending during this job. It rechecks the loaded header after the
 confirmation. Unreadable or corrupt recognized headers are refused. Check the
 physical tape label before confirming: unrelated backups on a reused cartridge
@@ -841,9 +851,21 @@ will be lost. Read/restore and append-selection prompts never offer an erase.
 Automated media loaders still must supply blank media; this feature requires
 interactive confirmation.
 
+New backups record ancestor IDs in their volume headers and catalog summaries,
+so protection survives restarting the application. Older full backups can start
+a chain with complete ancestry. Older incrementals may not record every ancestor;
+they remain readable and appendable, but in-prompt wiping of recorded cartridges
+is refused when the chain is incomplete. Supply a blank spare in that case, or
+initialize spares with the standalone `wipe` command before starting the job.
+The list is bounded to 512 ancestors; exceeding it retains append/restore support
+and marks the ancestry incomplete rather than silently dropping wipe protection.
+Starting a new full backup starts a new complete list. These are optional metadata
+fields; the tape formats and existing restore compatibility are unchanged.
+
 The active backup performs this erase under its existing drive lock. A separate
 `tape-backup wipe` process still refuses to run while a backup/restore holds the
-lock. Use the drive's eject button to swap tapes at a prompt. This feature does
+lock. Type `eject` at the load prompt to unlock and unload the drive without ending
+the operation, or use the drive's eject button. This feature does
 not provide resume support for an already exited backup, and replacing the
 executable cannot add it to a process that is already running.
 
@@ -898,11 +920,15 @@ prompts. The application never ejects automatically. When finished, eject explic
 ./tape-backup eject --device /dev/nst0
 ```
 
-This rewinds and unloads the selected drive; `/dev/nst0` is the default. It uses
+This unlocks, rewinds, and unloads the selected drive; `/dev/nst0` is the default. It uses
 the same drive lock as other commands and refuses to run while another job under
 any Unix account holds that lock, including while waiting for a tape change.
-At a tape-change prompt, use the drive's eject button to replace the cartridge,
-then press Enter. Every incremental retains the final base cartridge for writing
+At a tape-change prompt, type `eject` to unlock and unload the current cartridge
+under the active operation's lock. This works during backup, restore, verification,
+inspection, and append selection. The prompt keeps the same requested cartridge
+and preserves buffered data; insert the replacement and press Enter. An unload
+failure returns to the prompt. The physical eject button remains usable when the
+drive allows removal. Every incremental retains the final base cartridge for writing
 unless it needs a blank continuation cartridge. Pressing Enter at a continuation
 prompt cannot authorize overwriting the still-loaded base tape.
 If a recorded tape is inserted, the prompt repeats for the same volume. The

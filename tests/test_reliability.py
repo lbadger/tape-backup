@@ -116,6 +116,55 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(len(positions), 2)
         self.assertEqual(len(set(positions)), 2)
 
+    def test_missing_backup_or_volume_in_valid_catalog_never_scans_archive_payload(self):
+        media = TapeMedia()
+        full = self.create(media)
+        for backup_id, number in (('f' * 32, 1), (full, 2)):
+            media.mt('rewind')
+            volume = media.raw_open(False)
+            try:
+                with patch.object(TapeVolume, 'skip_payload', side_effect=AssertionError('Archive scan')):
+                    self.assertFalse(tb.select_volume(volume, backup_id, number))
+            finally:
+                volume.close()
+
+    def test_partial_catalog_cannot_hide_an_earlier_backup(self):
+        media = TapeMedia()
+        full = self.create(media)
+        (self.source / 'new').write_text('one')
+        first = self.create(media, full)
+        (self.source / 'later').write_text('two')
+        self.create(media, first)
+        original = tb.latest_metadata
+        def partial(*args, **kwargs):
+            cached = original(*args, **kwargs)
+            return {**cached, 'entries': cached['entries'][-1:]}
+        media.mt('rewind')
+        volume = media.raw_open(False)
+        try:
+            with patch.object(tb, 'latest_metadata', partial):
+                self.assertTrue(tb.select_volume(volume, first, 1))
+            self.assertEqual(tb.decoded_header(volume.read())['backup']['id'], first)
+        finally:
+            volume.close()
+
+    def test_catalog_with_wrong_endpoints_is_not_trusted_for_negative_lookup(self):
+        media = TapeMedia()
+        full = self.create(media)
+        original = tb.latest_metadata
+        def wrong(*args, **kwargs):
+            cached = original(*args, **kwargs)
+            cached['entries'][0]['header_sha256'] = '0' * 64
+            return cached
+        media.mt('rewind')
+        volume = media.raw_open(False)
+        try:
+            with patch.object(tb, 'latest_metadata', wrong), \
+                    self.assertRaisesRegex(tb.BackupError, 'different or corrupt cartridge'):
+                tb.select_volume(volume, 'f' * 32, 1)
+        finally:
+            volume.close()
+
     def test_inspection_reports_missing_catalog_without_scanning_unless_enabled(self):
         media = TapeMedia()
         with patch.object(tb, 'write_metadata', return_value=False):
