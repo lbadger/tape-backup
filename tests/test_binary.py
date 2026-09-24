@@ -49,7 +49,7 @@ class BinaryTests(unittest.TestCase):
         self.run_binary("restore", "--backup", *backup_ids,
                         "--destination", self.root / "restored",
                         "--media-dir", self.media)
-        self.assertIn("./change", self.last_stderr)
+        self.assertIn("./", self.last_stderr)
         self.assertIn("MiB/s", self.last_stderr)
         self.assertIn("ETA", self.last_stderr)
         expected = {p.name: p.read_bytes() for p in self.source.iterdir()}
@@ -57,24 +57,31 @@ class BinaryTests(unittest.TestCase):
         self.assertEqual(actual, expected)
 
     def test_relocated_binary_without_python_full_and_incremental_restore(self):
-        self.assertEqual(self.run_binary("--version"), "tape-backup 1.0.0")
+        self.assertEqual(self.run_binary("--version"), "tape-backup 2.0.0")
         self.assertIn("/dev/nst0", self.run_binary("backup", "--help"))
+        self.assertNotIn('--volume-size', self.run_binary('backup', '--help'))
         full = self.run_binary(*self.backup_args)
         self.assertIn("./change", self.last_stderr)
         self.assertIn("MiB/s", self.last_stderr)
         self.assertIn("ETA", self.last_stderr)
         self.assertGreater(len(list(self.media.glob(f"{full}.*.tape"))), 1)
+        names = self.run_binary('list', '--media-dir', self.media).splitlines()
+        self.assertEqual(set(names), {'./', './keep', './change', './remove'})
+        self.assertIn('complete', self.last_stderr)
         (self.source / "change").write_text("delta")
         (self.source / "remove").unlink()
         (self.source / "added").write_text("new")
         delta = self.run_binary(*self.backup_args, "--level", "incremental", "--base", full)
+        names = self.run_binary('list', '--backup', delta, '--media-dir', self.media).splitlines()
+        self.assertEqual(set(names), {'./', './change', './added'})
         self.restore([full, delta])
         info = json.loads(self.run_binary("verify", "--backup", delta, "--media-dir", self.media))
         self.assertEqual(info["parent"], full)
         self.assertTrue(info["data_verified"])
         self.assertFalse(list(self.root.rglob("*.tar")))
         self.assertFalse(list(self.root.rglob("*.snar")))
-        self.assertFalse(list(self.root.rglob("*.json")))
+        self.assertEqual(list(self.root.rglob('*.json')),
+                         [tb.restore_marker_path(self.root / 'restored')])
 
     def test_binary_rejects_incomplete_backup_and_can_start_again(self):
         wrapper = self.tools / "tar"
@@ -90,6 +97,108 @@ class BinaryTests(unittest.TestCase):
         wrapper.symlink_to(self.tar)
         backup_id = self.run_binary(*self.backup_args)
         self.restore([backup_id])
+
+    def test_binary_appends_two_incrementals_on_one_cartridge(self):
+        args = ['backup', '--source', self.source, '--media-dir', self.media,
+                '--volume-size', '20MiB', '--buffer-size', '256KiB', '--quiet']
+        full = self.run_binary(*args)
+        original_file = self.media / f'{full}.0001.tape'
+        original = original_file.read_bytes()
+        (self.source / 'change').write_text('first delta')
+        (self.source / 'remove').unlink()
+        first = self.run_binary(*args, '--level', 'incremental', '--base', full)
+        self.assertIn('no archive scan', self.last_stderr)
+        (self.source / 'added').write_text('second delta')
+        second = self.run_binary(*args, '--level', 'incremental', '--base', first, '--append')
+        self.assertEqual(list(self.media.glob('*.tape')), [original_file])
+        self.assertEqual(original_file.read_bytes()[:len(original)], original)
+        listing = json.loads(self.run_binary('inspect', '--media-dir', self.media))
+        self.assertEqual([b['id'] for b in listing['backups']], [full, first, second])
+        self.assertTrue(listing['scan_complete'])
+        self.assertEqual({b['listing_method'] for b in listing['backups']}, {'catalog'})
+        self.assertEqual(json.loads(self.run_binary('inspect', '--all', '--media-dir', self.media)), listing)
+        self.assertEqual(json.loads(self.run_binary('inspect', '--first', '--media-dir', self.media))['id'], full)
+        self.assertEqual(json.loads(self.run_binary('inspect', '--backup', second,
+                                                   '--media-dir', self.media))['parent'], first)
+        self.restore([full, first, second])
+        info = json.loads(self.run_binary('verify', '--backup', second, '--media-dir', self.media))
+        self.assertTrue(info['data_verified'])
+
+    def test_binary_restores_incrementals_across_separate_invocations(self):
+        full = self.run_binary(*self.backup_args)
+        self.restore([full])
+        (self.source / 'change').write_text('first delta')
+        (self.source / 'remove').unlink()
+        first = self.run_binary(*self.backup_args, '--level', 'incremental', '--base', full)
+        self.restore([first])
+        (self.source / 'added').write_text('second delta')
+        second = self.run_binary(*self.backup_args, '--level', 'incremental', '--base', first)
+        self.restore([second])
+        self.run_binary('restore', '--backup', first, '--destination', self.root / 'restored',
+                        '--media-dir', self.media, expected=1)
+        self.assertIn('out-of-order', self.last_stderr)
+
+    def test_binary_adopts_an_older_restore_with_explicit_base(self):
+        full = self.run_binary(*self.backup_args)
+        self.restore([full])
+        tb.restore_marker_path(self.root / 'restored').unlink()
+        (self.source / 'change').write_text('incremental')
+        delta = self.run_binary(*self.backup_args, '--level', 'incremental', '--base', full)
+        self.run_binary('restore', '--backup', delta, '--base', full,
+                        '--destination', self.root / 'restored', '--media-dir', self.media)
+        self.assertEqual((self.root / 'restored' / 'change').read_text(), 'incremental')
+
+    def test_eject_help_and_device_validation(self):
+        self.assertIn('/dev/nst0', self.run_binary('eject', '--help'))
+        self.run_binary('eject', '--device', self.source / 'keep', expected=1)
+        self.assertIn('tape character device', self.last_stderr)
+        self.run_binary('eject', '--media-dir', self.media, expected=2)
+        self.assertIn('unrecognized arguments', self.last_stderr)
+
+    def test_wipe_help_rejects_regular_files_and_simulated_media(self):
+        help_text = self.run_binary('wipe', '--help')
+        for option in ('/dev/nst0', '--long', '--yes'):
+            self.assertIn(option, help_text)
+        path = self.source / 'keep'
+        before = path.read_bytes()
+        self.run_binary('wipe', '--device', path, '--yes', expected=1)
+        self.assertIn('tape character device', self.last_stderr)
+        self.assertEqual(path.read_bytes(), before)
+        self.run_binary('wipe', '--media-dir', self.media, '--yes', expected=2)
+        self.assertIn('unrecognized arguments', self.last_stderr)
+
+    def test_compression_help_and_invalid_device_and_action(self):
+        help_text = self.run_binary('compression', '--help')
+        for option in ('/dev/nst0', 'status', 'on', 'off'):
+            self.assertIn(option, help_text)
+        self.run_binary('compression', 'status', '--device', self.source / 'keep', expected=1)
+        self.assertIn('tape character device', self.last_stderr)
+        self.run_binary('compression', 'invalid', expected=2)
+        self.assertIn('invalid choice', self.last_stderr)
+        self.run_binary('compression', 'status', '--media-dir', self.media, expected=2)
+        self.assertIn('unrecognized arguments', self.last_stderr)
+
+    def test_inspect_discovers_id_from_header_only_then_verify_rejects_truncation(self):
+        full = self.run_binary(*self.backup_args)
+        (self.source / 'added').write_text('new')
+        delta = self.run_binary(*self.backup_args, '--level', 'incremental', '--base', full)
+        for volume in self.media.glob('*.tape'):
+            if volume.name != f'{delta}.0001.tape':
+                volume.unlink()
+        with (self.media / f'{delta}.0001.tape').open('r+b') as first:
+            first.truncate(tb.BLOCK_SIZE)
+        info = json.loads(self.run_binary('inspect', '--first', '--media-dir', self.media))
+        self.assertEqual(info['id'], delta)
+        self.assertEqual(info['parent'], full)
+        self.assertEqual(info['level'], 'incremental')
+        self.assertEqual(info['source'], str(self.source.resolve()))
+        self.assertEqual(info['volume'], 1)
+        self.assertTrue(info['header_verified'])
+        self.assertFalse(info['data_verified'])
+        self.assertFalse(info['completion_verified'])
+        self.assertNotIn('volumes', info)
+        self.run_binary('verify', '--backup', delta, '--media-dir', self.media, expected=1)
+        self.assertIn('Incomplete backup', self.last_stderr)
 
     def test_binary_restores_library_path_for_system_tar(self):
         original = self.root / "original-libraries"
@@ -115,6 +224,16 @@ class BinaryTests(unittest.TestCase):
         self.assertNotIn("./change", self.last_stderr)
         self.assertIn("MiB/s", self.last_stderr)
         self.assertIn("ETA", self.last_stderr)
+
+    def test_binary_exclusions_and_structured_verified_summary(self):
+        info = json.loads(self.run_binary(*self.backup_args, '--exclude', 'remove', '--json', '--verify'))
+        self.assertTrue(info['archive_complete'])
+        self.assertTrue(info['data_verified'])
+        names = self.run_binary('list', '--backup', info['id'], '--media-dir', self.media).splitlines()
+        self.assertNotIn('./remove', names)
+        self.assertIn('./keep', names)
+        self.assertIn('Native ZFS', self.run_binary())
+        self.assertIn('--snapshot', self.run_binary('help', 'zfs-backup'))
 
     def test_binary_default_buffer_and_10_gib_limit(self):
         args = ["backup", "--source", self.source, "--media-dir", self.media,

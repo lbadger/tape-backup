@@ -1,5 +1,5 @@
 """Streaming format tests with real GNU tar and injected tape failures."""
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 import errno
 import hashlib
 import io
@@ -353,7 +353,7 @@ class StreamingTests(unittest.TestCase):
         self.extract([full])
         self.assertEqual(tree_contents(self.destination), expected)
 
-    def test_inspect_discovers_id_and_skips_payload_but_verify_checks_it(self):
+    def test_metadata_scan_discovers_id_and_skips_payload_but_verify_checks_it(self):
         self.seed()
         full = self.create()
         with patch.object(tb.Volume, 'skip_payload', autospec=True,
@@ -363,6 +363,69 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual(info['id'], full)
         self.assertFalse(info['data_verified'])
         self.assertTrue(tb.scan(self.media, full)['data_verified'])
+
+    def test_inspect_reads_one_physical_record_and_closes_the_volume(self):
+        self.seed()
+        full = self.create()
+        with (self.media.directory / f'{full}.0001.tape').open('rb') as first:
+            header = first.read(tb.BLOCK_SIZE)
+        stream = Mock()
+        stream.read.side_effect = [header, AssertionError('Inspection read beyond the header')]
+        media = Mock()
+        media.open.return_value = tb.Volume(stream, physical=True)
+        info = tb.inspect_backup(media)
+        media.load.assert_called_once_with(None, 1, False)
+        media.open.assert_called_once_with(False)
+        stream.read.assert_called_once_with(tb.BLOCK_SIZE)
+        stream.close.assert_called_once_with()
+        self.assertEqual(info['id'], full)
+        self.assertEqual(info['source'], str(self.source.resolve()))
+        self.assertEqual(info['level'], 'full')
+        self.assertIsNone(info['parent'])
+        self.assertEqual(info['volume'], 1)
+        self.assertTrue(info['header_verified'])
+        self.assertFalse(info['data_verified'])
+        self.assertFalse(info['completion_verified'])
+        for field in ('data_bytes', 'data_sha256', 'volumes', 'chunks'):
+            self.assertNotIn(field, info)
+
+    def test_inspect_can_identify_an_incomplete_backup_without_later_volumes(self):
+        self.seed()
+        full = self.create()
+        volumes = sorted(self.media.directory.glob(f'{full}.*.tape'))
+        self.assertGreater(len(volumes), 1)
+        for volume in volumes[1:]:
+            volume.unlink()
+        with volumes[0].open('r+b') as first:
+            first.truncate(tb.BLOCK_SIZE)
+        info = tb.inspect_backup(self.media)
+        self.assertEqual(info['id'], full)
+        self.assertFalse(info['completion_verified'])
+        with self.assertRaisesRegex(tb.BackupError, 'Incomplete backup'):
+            tb.scan(self.media, full)
+
+    def test_inspect_rejects_invalid_headers_and_closes_the_volume(self):
+        full = self.create()
+        with (self.media.directory / f'{full}.0001.tape').open('rb') as first:
+            header = first.read(tb.BLOCK_SIZE)
+        fields = tb.decoded_header(header)
+        cases = [
+            ('checksum', header.replace(full.encode(), b'f' * 32), None),
+            ('truncated', header[:-1], None),
+            ('wrong backup', header, '0' * 32),
+            ('wrong volume', tb.encoded_header({**fields, 'volume': 2}), None),
+            ('wrong format', tb.encoded_header({**fields, 'format': 2}), None),
+            ('wrong prefix', header.replace(tb.MAGIC, b'TAPE-STREAM-2\n', 1), None),
+        ]
+        for name, record, expected_id in cases:
+            with self.subTest(name=name):
+                stream = Mock()
+                stream.read.return_value = record
+                media = Mock()
+                media.open.return_value = tb.Volume(stream, physical=True)
+                with self.assertRaises(tb.BackupError):
+                    tb.inspect_backup(media, expected_id)
+                stream.close.assert_called_once_with()
 
     def test_bad_source_and_small_buffer_or_volume_rejected(self):
         with self.assertRaises(tb.BackupError):
@@ -447,7 +510,8 @@ class StreamingTests(unittest.TestCase):
                 patch.object(tb, 'run_command') as mt:
             media.mt('rewind')
             self.assertEqual(mt.call_args_list[0].args, (['mt', '-f', '/dev/nst1', 'stclearoptions', '0xa002'],))
-            self.assertEqual(mt.call_args_list[1].args, (['mt', '-f', '/dev/nst1', 'rewind'],))
+            self.assertEqual(mt.call_args_list[1].args, (['mt', '-f', '/dev/nst1', 'stsetoptions', 'scsi2logical'],))
+            self.assertEqual(mt.call_args_list[2].args, (['mt', '-f', '/dev/nst1', 'rewind'],))
 
     def test_eta_uses_payload_completion_and_reports_measured_rate(self):
         progress = tb.Progress('Test')
@@ -480,6 +544,32 @@ class StreamingTests(unittest.TestCase):
             self.create()
         self.assertFalse(list(self.media.directory.glob('*.tape')))
 
+    def test_backup_inspect_verify_incremental_and_restore_never_eject(self):
+        self.seed()
+        self.media.eject = Mock(side_effect=AssertionError('Automatic ejection'))
+        self.media.release = Mock(side_effect=AssertionError('Automatic media release'))
+
+        def command(*args):
+            output = io.StringIO()
+            with patch.object(tb, 'TapeMedia', return_value=self.media), redirect_stdout(output):
+                self.assertEqual(tb.main(list(map(str, args))), 0)
+            return output.getvalue().strip()
+
+        backup_args = ('backup', '--source', self.source, '--volume-size', '512KiB',
+                       '--buffer-size', '64KiB', '--quiet')
+        full = command(*backup_args)
+        self.assertGreater(len(list(self.media.directory.glob(f'{full}.*.tape'))), 1)
+        self.assertEqual({b['id'] for b in json.loads(command('inspect'))['backups']}, {full})
+        self.assertTrue(json.loads(command('verify', '--backup', full))['data_verified'])
+        (self.source / 'changed').write_bytes(os.urandom(400_000))
+        (self.source / 'deleted').unlink()
+        delta = command(*backup_args, '--level', 'incremental', '--base', full)
+        self.assertGreater(len(list(self.media.directory.glob(f'{delta}.*.tape'))), 1)
+        command('restore', '--backup', full, delta, '--destination', self.destination, '--quiet')
+        self.assertEqual(tree_contents(self.source), tree_contents(self.destination))
+        self.media.eject.assert_not_called()
+        self.media.release.assert_not_called()
+
     def test_tape_device_validation_and_selected_drive_loading(self):
         for mode, device in ((stat.S_IFREG, 0), (stat.S_IFCHR, os.makedev(9, 1)),
                              (stat.S_IFCHR, os.makedev(1, 128))):
@@ -490,13 +580,11 @@ class StreamingTests(unittest.TestCase):
         with patch.object(tb.os, 'stat', return_value=info), \
                 patch.object(tb.shutil, 'which', return_value='/usr/bin/mt'):
             media = tb.TapeMedia('/dev/nst1', '/loader')
-        with patch.object(tb, 'run_command') as command, patch.object(Path, 'read_text', return_value='0x0'):
+        with patch.object(tb, 'run_command') as command, patch.object(Path, 'read_text', return_value='0x800'):
             media.load('a'*32, 2, True)
-            media.release()
         self.assertEqual([call.args[0] for call in command.call_args_list], [
             ['/loader', 'write', 'a'*32, '2', '/dev/nst1'],
-            ['mt', '-f', '/dev/nst1', 'rewind'], ['mt', '-f', '/dev/nst1', 'setblk', '0'],
-            ['mt', '-f', '/dev/nst1', 'offline']])
+            ['mt', '-f', '/dev/nst1', 'rewind'], ['mt', '-f', '/dev/nst1', 'setblk', '0']])
 
     def test_manual_tape_changes_use_a_nonseekable_terminal(self):
         for writing, response in ((True, b'\n'), (False, b'\n'),
@@ -547,6 +635,52 @@ class StreamingTests(unittest.TestCase):
                 self.assertRaisesRegex(tb.BackupError, 'No terminal.*No such device or address'):
             media.load('a'*32, 1, True)
         media.mt.assert_not_called()
+
+
+class EjectTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.media = object.__new__(tb.TapeMedia)
+        self.media.device = '/dev/nst1'
+        self.media.device_number = os.makedev(9, 129)
+        context = patch.object(Path, 'home', return_value=Path(self.tmp.name))
+        context.start()
+        self.addCleanup(context.stop)
+
+    def test_eject_uses_selected_device_without_loading_or_prompting(self):
+        for args, device in ((['eject'], '/dev/nst0'),
+                             (['eject', '--device', '/dev/nst1'], '/dev/nst1')):
+            with self.subTest(device=device):
+                self.media.device = device
+                output = io.StringIO()
+                with patch.object(tb, 'TapeMedia', return_value=self.media) as factory, \
+                        patch.object(tb, 'run_command') as command, redirect_stdout(output):
+                    self.assertEqual(tb.main(args), 0)
+                factory.assert_called_once_with(device)
+                command.assert_called_once_with(['mt', '-f', device, 'offline'])
+                self.assertEqual(output.getvalue().strip(), f'Ejected tape from {device}')
+
+    def test_eject_refuses_a_drive_locked_by_another_job(self):
+        output, errors = io.StringIO(), io.StringIO()
+        with self.media.lock(), patch.object(tb, 'TapeMedia', return_value=self.media), \
+                patch.object(tb, 'run_command') as command, \
+                redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(tb.main(['eject', '--device', self.media.device]), 1)
+        command.assert_not_called()
+        self.assertEqual(output.getvalue(), '')
+        self.assertIn('Another operation', errors.getvalue())
+
+    def test_eject_failure_is_reported_and_releases_the_lock(self):
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(tb, 'TapeMedia', return_value=self.media), \
+                patch.object(tb, 'run_command', side_effect=tb.BackupError('Drive busy')), \
+                redirect_stdout(output), redirect_stderr(errors):
+            self.assertEqual(tb.main(['eject', '--device', self.media.device]), 1)
+        self.assertEqual(output.getvalue(), '')
+        self.assertIn('Drive busy', errors.getvalue())
+        with self.media.lock():
+            pass
 
 
 class ReadAheadTests(unittest.TestCase):

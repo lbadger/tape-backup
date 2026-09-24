@@ -30,7 +30,7 @@ class SSHServer:
             server_config.write_text(
                 f"Port {self.port}\nListenAddress 127.0.0.1\nHostKey {self.root}/host\n"
                 f"PidFile {self.root}/pid\nAuthorizedKeysFile {self.root}/client.pub\n"
-                "StrictModes no\nUsePAM no\nPasswordAuthentication no\n"
+                f"StrictModes no\nUsePAM {'yes' if os.geteuid() == 0 else 'no'}\nPasswordAuthentication no\n"
                 "KbdInteractiveAuthentication no\nPubkeyAuthentication yes\nPermitRootLogin prohibit-password\n"
                 "AllowTcpForwarding no\nX11Forwarding no\nLogLevel ERROR\n")
             self.log = open(self.root / "server.log", "w+")

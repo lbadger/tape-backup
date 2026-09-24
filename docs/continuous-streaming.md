@@ -71,7 +71,7 @@ volume would create an unreadable tape set.
 
 ## Format
 
-Format 3 is the only supported tape format. It has `TAPE-STREAM-3` checksummed
+Tar uses format 3. It has `TAPE-STREAM-3` checksummed
 headers, small payload frames, and a bounded `replay_bytes` declaration in every
 volume header. Readers keep a bounded history
 of sequence numbers and header digests, not old payloads. An overlapping frame must

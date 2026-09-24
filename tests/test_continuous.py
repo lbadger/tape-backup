@@ -104,8 +104,8 @@ class ContinuousTests(unittest.TestCase):
     def test_continuous_writes_retire_durable_frames_without_per_frame_commits(self):
         media = BufferedMedia(self.root / 'media')
         self.round_trip(media)
-        # Only the volume header and final completion flush; ~26 frames written.
-        self.assertEqual(dict(media.commits), {1: 2})
+        # Header, archive completion, and metadata file; ~26 archive frames.
+        self.assertEqual(dict(media.commits), {1: 3})
         self.assertGreater(len(media.positions), 20)
         self.assertTrue(any(accepted > durable > 1 for _, accepted, durable in media.positions))
         self.assertIn('recovery 0.0 MiB', self.output.getvalue())
@@ -140,7 +140,7 @@ class ContinuousTests(unittest.TestCase):
     def test_completion_is_flushed_even_if_position_already_confirmed_every_frame(self):
         media = BufferedMedia(self.root / 'media', lag=0)
         self.round_trip(media)
-        self.assertEqual(dict(media.commits), {1: 2})
+        self.assertEqual(dict(media.commits), {1: 3})
 
     def test_final_flush_failure_replays_entire_window_without_telemetry(self):
         for lose in (False, True):
@@ -165,7 +165,8 @@ class ContinuousTests(unittest.TestCase):
         media = BufferedMedia(self.root / 'media')
         self.round_trip(media, cap=1024**2)
         self.assertGreater(len(media.commits), 1)
-        self.assertTrue(all(count == 2 for count in media.commits.values()))
+        self.assertTrue(all(count == 2 for n, count in media.commits.items() if n != media.number))
+        self.assertIn(media.commits[media.number], (2, 3))  # Footer when space permits.
         self.assertTrue(all(p.stat().st_size <= 1024**2 for p in media.directory.glob('*.tape')))
 
     def test_replayed_frame_with_valid_but_changed_checksum_is_rejected(self):
@@ -233,14 +234,14 @@ class ContinuousTests(unittest.TestCase):
         backup_id = tb.backup(self.source, media, quiet=True)
         first = media.directory / f'{backup_id}.0001.tape'
         original = first.read_bytes()
-        for magic in (b'TAPE-STREAM-1\n', b'TAPE-STREAM-2\n', b'TAPE-STREAM-4\n'):
+        for magic in (b'TAPE-STREAM-1\n', b'TAPE-STREAM-2\n', b'TAPE-STREAM-4\n', b'TAPE-STREAM-5\n'):
             with self.subTest(magic=magic):
                 first.write_bytes(magic + original[len(tb.MAGIC):])
                 for verify in (False, True):
-                    with self.assertRaisesRegex(tb.BackupError, 'Wrong tape format'):
+                    with self.assertRaisesRegex(tb.BackupError, 'Wrong tape format|Corrupt tape header'):
                         tb.scan(media, backup_id, verify=verify)
                 destination = self.root / 'unsupported-restore'
-                with self.assertRaisesRegex(tb.BackupError, 'Wrong tape format'):
+                with self.assertRaisesRegex(tb.BackupError, 'Wrong tape format|Corrupt tape header'):
                     tb.restore([backup_id], destination, media, quiet=True)
                 self.assertFalse(destination.exists())
 
@@ -256,7 +257,7 @@ class ContinuousTests(unittest.TestCase):
                     header['format'] = version
                     volume.write_bytes(tb.encoded_header(header) + original[tb.BLOCK_SIZE:])
                     for verify in (False, True):
-                        with self.assertRaisesRegex(tb.BackupError, 'only format 3 is supported'):
+                        with self.assertRaisesRegex(tb.BackupError, 'unsupported tape format|archive type does not match'):
                             tb.scan(media, backup_id, verify=verify)
             volume.write_bytes(original)
 

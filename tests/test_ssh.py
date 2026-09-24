@@ -17,6 +17,7 @@ from unittest.mock import Mock, patch
 
 import tape_backup as tb
 from ssh_fixture import SSHServer
+from test_append import TapeMedia as SimulatedTapeMedia, Cartridge
 from test_tape_backup import FaultMedia, tree_contents
 
 
@@ -66,6 +67,31 @@ class SSHTests(unittest.TestCase):
                          buffer_size=10 * 1024**3, quiet=True)
         self.restore([full])
 
+    def test_remote_stream_continues_after_rejecting_a_used_continuation_tape(self):
+        media = SimulatedTapeMedia(capacity=12)
+        used = Cartridge()
+        used.records = [b'previous backup'.ljust(tb.BLOCK_SIZE, b'\0'), None]
+        before = list(used.records)
+        request = media.request
+        attempts = []
+        def wrong_then_blank(backup_id, number, action):
+            if action == 'blank' and number == 2:
+                attempts.append((backup_id, number, action))
+                if len(attempts) == 1:
+                    media.active = used
+                    return
+            request(backup_id, number, action)
+        media.request = wrong_then_blank
+        full = tb.backup(self.source, media, ssh=self.ssh, buffer_size=256 * 1024, quiet=True)
+        self.assertEqual(attempts, [(full, 2, 'blank')] * 2)
+        self.assertEqual(used.records, before)
+        self.assertIn('Backup remains active', self.output.getvalue())
+        media.loaded = False
+        self.assertTrue(tb.scan(media, full)['data_verified'])
+        destination = self.root / 'restored'
+        tb.restore([full], destination, media, quiet=True)
+        self.assertEqual(tree_contents(destination), tree_contents(self.source))
+
     def test_old_ssh_protocol_is_rejected_before_tape_writing(self):
         self.program.write_text("#!/bin/sh\nprintf 'TAPE-SSH-1\\n'\n")
         with self.assertRaisesRegex(tb.BackupError, 'Unsupported SSH source protocol'):
@@ -98,14 +124,31 @@ class SSHTests(unittest.TestCase):
         self.assertTrue(info["data_verified"])
         self.assertIn("MiB/s", self.output.getvalue())
         self.assertIn("ETA", self.output.getvalue())
-        for pattern in ("*.tar", "*.snar", "*.json", "UNWANTED"):
+        for pattern in ("*.tar", "*.snar", "UNWANTED"):
             self.assertFalse(list(self.root.rglob(pattern)))
+        self.assertEqual(list(self.root.rglob('*.json')),
+                         [tb.restore_marker_path(self.root / 'restored')])
 
     def test_remote_stream_survives_tape_flush_failure_and_replay(self):
         self.media.fail_commit = True
         full = self.create()
         self.assertIn("uncommitted chunk(s)", self.output.getvalue())
         self.restore([full])
+
+    def test_remote_incremental_appends_using_cached_snapshot(self):
+        self.media = tb.FileMedia(self.root / 'append-media')
+        full = tb.backup(self.source, self.media, ssh=self.ssh, quiet=True)
+        tape = next(self.media.directory.glob('*.tape'))
+        original = tape.read_bytes()
+        (self.source / 'change').write_text('appended delta')
+        (self.source / 'delete').unlink()
+        delta = tb.backup(self.source, self.media, ssh=self.ssh, quiet=True,
+                          level='incremental', base=full)
+        self.assertIn('no archive scan', self.output.getvalue())
+        self.assertEqual(list(self.media.directory.glob('*.tape')), [tape])
+        self.assertEqual(tape.read_bytes()[:len(original)], original)
+        self.program.unlink()
+        self.restore([full, delta])
 
     def test_remote_wrong_host_and_path_rejected_before_writing_new_tapes(self):
         full = self.create()
@@ -166,7 +209,7 @@ outgoing.flush()
 request = tb.receive_json(incoming)
 while tb.receive_packet(incoming, tb.BLOCK_SIZE)[0] != b'e':
     pass
-tb.send_packet(outgoing, b'j', tb.json.dumps({{'source': request['source'], 'estimated_bytes': 200000}}).encode())
+tb.send_packet(outgoing, b'j', tb.json.dumps({{'source': request['source'], 'estimated_bytes': 200000, 'excludes': request['excludes']}}).encode())
 tb.receive_packet(incoming, 0)
 tb.send_packet(outgoing, b'd', b'x' * tb.BLOCK_SIZE)
 raise SystemExit(255)
@@ -329,8 +372,9 @@ class BinarySSHTests(unittest.TestCase):
             remote.unlink()
             run("restore", "--backup", full, delta, "--destination", root / "restored", "--media-dir", media)
             self.assertEqual(tree_contents(source), tree_contents(root / "restored"))
-            for pattern in ("*.tar", "*.snar", "*.json"):
+            for pattern in ("*.tar", "*.snar"):
                 self.assertFalse(list(root.rglob(pattern)))
+            self.assertEqual(list(root.rglob('*.json')), [tb.restore_marker_path(root / 'restored')])
 
 
 if __name__ == "__main__":

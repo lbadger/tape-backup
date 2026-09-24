@@ -1,8 +1,89 @@
 # Changelog
 
-## Unreleased
+## 2.0.0 — 2026-09-24
 
-- Support only the current format-3 tapes. Remove format-2 header decoding,
+- Add native `zfs-backup` and `zfs-restore` for existing filesystem snapshots,
+  full/incremental streams, local/SSH sources, and encrypted raw sends. Validate
+  snapshot GUIDs and keep received datasets read-only/unmounted. Never force a
+  rollback. New ZFS volume headers use format 4; tar format 3 remains readable.
+- Add `--exclude` and `--exclude-from`, source-relative wildcard matching,
+  inventory pruning, and policy inheritance for local/SSH incrementals. Reject
+  policy changes before writing; changing exclusions requires a new full backup.
+- Require blank media for full backups as well as continuations. Initialize used
+  cartridges explicitly with `wipe`; pressing Enter cannot authorize overwrite.
+- Retry wrong read cartridges without losing accepted restore progress. Use a
+  shared drive lock across accounts and tape-mode aliases, and clean up on SIGTERM.
+- Remove redundant inspection seeks and unneeded RAM snapshot copies. Physical
+  inspection requires `--scan` for sequential fallback and returns nonzero for
+  incomplete results while retaining discovered backup entries.
+- Improve the no-argument menu/help with file and ZFS examples. Add read-only
+  `status`/`doctor`, JSON backup outcomes, and optional post-backup `--verify`.
+- Version the SSH transport as 3 so old helpers cannot silently ignore new
+  options. Update both ends of SSH backups together.
+- Add CI for the source, standalone executable, SSH, simulated cartridges, and
+  real OpenZFS scratch-pool round trips; retain an actual v1.0.0 format-3 fixture.
+
+- Add `list [--backup ID]` to print archived file names without extraction,
+  discover the first backup when no ID is supplied, and follow continuation
+  tapes. Verify the complete stream, keep names on stdout, and pause output at
+  tape prompts.
+- Keep `backup --volume-size` available as a hidden testing option. Document using
+  10 GiB limits on physical cartridges and verify planned volume changes and
+  complete multi-tape restores without filling the physical media.
+- Add `wipe` to initialize the loaded tape with short erase, explicit terminal
+  confirmation or `--yes`, and optional `--long`. Verify the tape is blank before
+  reporting success, leave it loaded, and honor the drive lock.
+- Pause progress and local/SSH child-process logging while waiting for a tape
+  change or loader. Resume after the response; keep diagnostic buffering bounded.
+- Add `compression [status|on|off]` with current drive-state queries, changes via
+  the Linux tape driver, read-back verification, and drive locking. Unsupported
+  or unreadable state never silently reports OFF.
+- Keep a backup active when a recorded cartridge is inserted for continuation.
+  Close the rejected tape and request the same volume again, retaining buffered
+  data and the local/SSH source stream. Preserve overwrite protection; never erase
+  or eject automatically. Cancellation and unrelated drive failures still stop
+  the operation.
+- Make `inspect` list every backup segment on the loaded cartridge by default,
+  including appended incrementals. Read the final metadata catalog and seek to
+  indexed headers without reading archive data; allow a scan when requested.
+  Keep `--all` as an alias and add `--first` for the previous one-header behavior.
+- Support restoring a full chain in one command or applying subsequent
+  incrementals to the same destination in separate commands. Record the last
+  successful restore in a small sibling history file; validate parent/source
+  ordering and verify requested incrementals before applying in place. Reject
+  further applies after an interrupted update. `restore --base ID` adopts a
+  directory restored by an older executable without re-extracting the full.
+- Retry loaded-cartridge lookup from the beginning when an incomplete trailing
+  metadata file would otherwise prevent rereading a completed backup.
+- Make every incremental append automatically; `--append` is an optional
+  compatibility flag. Fix the destructive default that could overwrite the full
+  backup when the base cartridge remained loaded. Require blank continuation
+  cartridges and reject recorded/ambiguous media before writing. Loaders receive
+  a distinct `blank` request for continuations.
+- Enable SCSI logical block addressing for tape catalog position/seek operations.
+  Check blankness before starting a full backup's first cartridge, and include
+  the device and startup operation in I/O errors. This addresses startup failures
+  on drives that reject the legacy device-dependent READ POSITION command form.
+- Add `backup --level incremental --base ID` to reuse the base's final
+  cartridge. Validate its recorded tail and source identity before writing at
+  end of data; continue onto fresh media with the existing replay mechanism.
+  Preserve existing format-3 backups and refuse interrupted or ambiguous tails.
+- Write a checksummed metadata file after each completed backup, with cartridge
+  segment locations and a copy of the latest GNU tar snapshot. Subsequent appends
+  can load the snapshot without traversing archive data. Existing tapes without
+  metadata use a scan fallback; no MAM or persistent local catalog is required.
+- Locate selected backup IDs on shared cartridges for restore, verify, and
+  inspect. Add `inspect --all` to list cartridge segments and report partial tails;
+  listing does not certify archive integrity. Reuse loaded cartridges in restores.
+- Document full and incremental flows with Mermaid diagrams, metadata placement,
+  change detection, append commands, and recovery limitations.
+- Stop automatically ejecting tapes, including at tape changes and after reading
+  an incremental base. Add `eject --device /dev/nst0` to rewind and unload a tape
+  explicitly, using the existing drive lock.
+- Make `inspect --first` read only the first 64 KiB tape header to discover the backup
+  ID and source metadata. Report that archive data and backup completion have
+  not been verified; use `verify` for full data checks.
+- Preserve format-3 tar tapes and add format-4 native ZFS headers. Remove format-2 header decoding,
   large legacy chunks, single-chunk replay compatibility, and filemark-based
   metadata skipping. Older formats are rejected by inspect, verify, restore,
   and incremental-base loading. Current format-3 backups are unchanged.
