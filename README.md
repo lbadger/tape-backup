@@ -13,26 +13,27 @@ snapshot identity. No cartridge
 MAM storage or persistent local manifest is required.
 
 File backups and restores print file names. Streaming operations report transfer
-totals, current and average MiB/s, elapsed time, and an approximate ETA.
+totals, current and average MiB/s, elapsed time, and an approximate ETA. Backups
+and restores also show an overall progress bar in terminals.
 `/dev/nst0` is the default; use `--device`
 to select another non-rewinding tape drive.
 
 ## Current executable
 
-Version **2.0.1** includes native ZFS streaming, file/folder exclusions, safer tape
-handling, clearer help, and drive diagnostics. It fixes shared restore locking,
-unnecessary continuation scans, and exclusion matching, and improves terminal
-progress and information displays. Existing format-3 tar backups
+Version **2.1.0** adds short erase at a backup's cartridge-change prompt and total
+progress bars for backup and restore. It includes native ZFS streaming,
+file/folder exclusions, shared restore locking, and readable drive diagnostics.
+Existing format-3 tar backups
 remain readable. Update both machines when using SSH; transport version 3 prevents
 older helpers from silently ignoring exclusion or ZFS options.
 
 Download the executable and checksum from the
-[v2.0.1 release](https://github.com/lbadger/tape-backup/releases/tag/v2.0.1), or
+[v2.1.0 release](https://github.com/lbadger/tape-backup/releases/tag/v2.1.0), or
 build from the current source checkout using Docker:
 
 ```bash
 ./build.sh
-./dist/tape-backup --version  # tape-backup 2.0.1
+./dist/tape-backup --version  # tape-backup 2.1.0
 (cd dist && sha256sum --check tape-backup.sha256)
 ```
 
@@ -77,15 +78,16 @@ Source file contents are never staged on disk. A successful command prints the
 backup ID on stdout; progress and file names go to stderr. Label every cartridge
 with that ID and the volume number shown in the prompt.
 
-**A new full backup requires a blank first cartridge.** Use the explicit `wipe`
-command to initialize previously used media before starting a full. Incrementals always validate the existing tail and write
+**A new full backup requires a blank first cartridge.** Initialize previously used
+media with the explicit `wipe` command, or type `wipe` at the backup's load prompt
+and confirm with `WIPE`. Incrementals always validate the existing tail and write
 after recorded data. Every continuation cartridge must be blank; recorded or
 unreadable cartridges are refused before any write, even after a tape-change prompt.
 Inserting a recorded continuation tape repeats the request for the same volume
 without ending the backup. Buffered data and the local or SSH source stream stay
-active. Load a blank cartridge, or type `q` to cancel. Previously used continuation
-tapes must be deliberately initialized with [`wipe`](#initialize-a-tape-for-reuse)
-before reuse; backup never erases them automatically.
+active. Load a blank cartridge, type `wipe` to initialize an unrelated used tape
+after confirmation, or type `q` to cancel. Backup never erases automatically;
+pressing Enter alone cannot authorize overwriting recorded data.
 Other drive errors or failures after writing begins still stop the operation when
 they cannot be recovered safely.
 Every backup has its own ID and volume numbers, even when sharing a cartridge.
@@ -494,6 +496,7 @@ at completion. Terminals show a block sized to the available width, for example:
 
 ```text
 Backup 726246ca4cb4 | writing volume 1, chunk 382644
+  Total [###############################-] ~99.9% (backup, estimated)
   Read 1,495.66 GiB  |  Delivered 1,494.70 GiB  |  Committed 1,494.25 GiB
   Buffer 1.00 GiB each  |  Queued 989.10 MiB  |  Recovery 479.40 MiB
   Source 176.0 MiB/s (reading)
@@ -504,8 +507,26 @@ Backup 726246ca4cb4 | writing volume 1, chunk 382644
 The progress heading abbreviates the ID; the startup message and successful
 backup result retain the full ID. Transfer counters use at most GiB so ordinary
 progress remains visible on multi-terabyte archives. Redirected stderr retains
-the compact log format. During the final tape commit and metadata write, ETA
+the compact log format with a total percentage rather than a graphical bar.
+During the final tape commit and metadata write, ETA
 shows `finalizing` until the command actually completes.
+
+The total bar spans **all cartridges** and, for restore, all backup IDs requested
+in that command. Backup percentages use the source inventory estimate and count
+unique payload delivered, so replayed data does not advance the bar twice.
+A fresh tar restore uses the estimate in each archive header; multiple archives
+receive equal shares of the bar, labeled `estimated by archive`. This avoids
+extra tape scans just to obtain a progress denominator. A large full archive and
+a small incremental can therefore take different amounts of time for equal
+portions of that estimated bar.
+
+In-place incremental restores and native ZFS restores already verify before
+applying data. Their total bar includes verification as the first half and
+application as the second half. Verification estimates progress by archive;
+application uses the exact verified archive sizes. Unknown sizes are shown as
+unknown. The display reserves **100% for successful completion**, including
+final flushing and restore history updates; reaching an estimate is not success.
+Progress stays silent during cartridge and wipe-confirmation prompts.
 
 Backup status shows the configured buffer budget, queued payload bytes, recovery
 bytes retained (including framing), and archive bytes confirmed on media. Each of
@@ -532,7 +553,8 @@ passed to GNU tar. The average includes elapsed media-change time.
 
 The ETA estimates remaining time for the **current archive**, not later
 incrementals in a restore chain. Backup estimates come from file metadata only;
-restore uses that estimate from the tape header. Sparse files, incremental
+restore uses that estimate from the tape header, or exact archive sizes after
+verification. Sparse files, incremental
 selection, directory changes, media changes, and final flushing can affect its
 accuracy. It starts as `calculating` and shows `finishing (estimate reached)` when
 an underestimated archive is still running. No source contents are read merely
@@ -793,11 +815,37 @@ as an error, not successful initialization. No automatic fallback to long erase
 is performed. This operates on the drive's current tape partition; it does not
 repartition media or certify erasure of other partitions or cartridge memory.
 
-Prepare continuation tapes **before starting the backup**, or use another drive.
-`wipe` takes the drive lock and refuses to run while a backup/restore holds it,
-including while that job is waiting for another tape. Use the drive's eject
-button to swap tapes at a prompt. `wipe` does not provide resume support for an
-already exited backup.
+You can also initialize an unrelated used cartridge **while a backup is waiting**:
+
+```text
+Press Enter when ready, or type wipe to short-erase the loaded tape, or q to stop: wipe
+...
+Type WIPE to confirm, or anything else to return to the tape prompt: WIPE
+Short erase in progress; backup buffers are retained...
+Blank tape verified; continuing backup on this cartridge.
+```
+
+This is available at the initial blank-tape prompt and continuation prompts for
+tar and native ZFS backups. It always requests a short erase, verifies the blank
+state, and continues on the same volume number. Canceling the erase returns to
+the load prompt without ending the backup. Refused or failed erases also return
+to that prompt, preserving pending data. The next write still requires a
+successful blank check.
+
+The prompt refuses tapes whose first header identifies the active backup or its
+base, and remembers first-header fingerprints of cartridges already written or
+selected for appending during this job. It rechecks the loaded header after the
+confirmation. Unreadable or corrupt recognized headers are refused. Check the
+physical tape label before confirming: unrelated backups on a reused cartridge
+will be lost. Read/restore and append-selection prompts never offer an erase.
+Automated media loaders still must supply blank media; this feature requires
+interactive confirmation.
+
+The active backup performs this erase under its existing drive lock. A separate
+`tape-backup wipe` process still refuses to run while a backup/restore holds the
+lock. Use the drive's eject button to swap tapes at a prompt. This feature does
+not provide resume support for an already exited backup, and replacing the
+executable cannot add it to a process that is already running.
 
 ## Drive status and diagnostics
 
@@ -852,13 +900,14 @@ prompts. The application never ejects automatically. When finished, eject explic
 
 This rewinds and unloads the selected drive; `/dev/nst0` is the default. It uses
 the same drive lock as other commands and refuses to run while another job under
-the same Unix account holds that lock, including while waiting for a tape change.
+any Unix account holds that lock, including while waiting for a tape change.
 At a tape-change prompt, use the drive's eject button to replace the cartridge,
 then press Enter. Every incremental retains the final base cartridge for writing
 unless it needs a blank continuation cartridge. Pressing Enter at a continuation
 prompt cannot authorize overwriting the still-loaded base tape.
 If a recorded tape is inserted, the prompt repeats for the same volume. The
-backup remains active until a blank cartridge is supplied or the operation is
+backup remains active until a blank cartridge is supplied, an unrelated used
+cartridge is explicitly short-erased through the prompt, or the operation is
 cancelled. Once the process exits, replacing the cartridge cannot resume it;
 the required streaming state existed only in RAM.
 
@@ -878,7 +927,8 @@ exercise roughly three cartridges. The limit applies to each tape, **not to the
 total source**; pointing at a multi-terabyte source still backs up that entire
 source. The first cartridge and all continuation
 cartridges must be blank. Initialize previously used test cartridges with `wipe`
-before starting. Label them with the printed backup ID and volume numbers.
+before starting or through the interactive load prompt. Label them with the
+printed backup ID and volume numbers.
 
 The writer commits and prompts for the next cartridge before exceeding the cap.
 It counts formatted record bytes, including headers and padding, before drive

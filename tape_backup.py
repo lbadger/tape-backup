@@ -4,7 +4,7 @@
 import argparse
 import codecs
 from collections import deque, OrderedDict
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 import ctypes
 from datetime import datetime, timezone
 import errno
@@ -36,7 +36,7 @@ POSITION_INTERVAL = 16 * 1024**2
 MAGIC = b"TAPE-STREAM-3\n"
 ZFS_MAGIC = b"TAPE-STREAM-4\n"
 ZERO_CHAIN = "0" * 64
-PROGRAM_VERSION = "2.0.1"
+PROGRAM_VERSION = "2.1.0"
 # Linux struct mtop: short operation, padding, int count (x86-64 / AArch64).
 MTIOCTOP = 0x40086D01
 MTWEOF = 5
@@ -299,7 +299,7 @@ def detail_rows(title, rows, width):
 
 
 class Progress:
-    def __init__(self, label, *, transfer=True, buffer_size=None):
+    def __init__(self, label, *, transfer=True, buffer_size=None, archives=None, passes=1):
         self.label = label
         self.transfer = transfer
         self.buffer_size = buffer_size
@@ -314,11 +314,65 @@ class Progress:
         self.total_bytes = None
         self.eta_base = 0
         self.eta_started = self.started
+        self.archives, self.passes = archives, passes
+        self.overall = None
 
     def estimate(self, total):
-        self.total_bytes = total
+        self.total_bytes = total if type(total) is int and total > 0 else None
         self.eta_base = self.written_bytes
         self.eta_started = time.monotonic()
+
+    def track_archive(self, total, *, archive=0, pass_number=0, stage='backup', sizes=None):
+        self.estimate(total)
+        self.overall = {'done': 0, 'archive': archive, 'pass': pass_number,
+                        'stage': stage, 'sizes': sizes, 'finished': False}
+
+    def advance(self, count):
+        if self.overall is not None:
+            self.overall['done'] += count
+
+    def finish_archive(self):
+        if self.overall is not None:
+            self.overall['finished'] = True
+
+    def total_progress(self, width=None):
+        state = self.overall
+        if self.archives is None:
+            return None
+        if self.phase == 'complete':
+            fraction, description, percentage = 1.0, 'complete', '100.0%'
+        elif state is None:
+            fraction, description, percentage = 0.0, 'waiting for archive size', '--%'
+        else:
+            done, size = state['done'], self.total_bytes
+            if state['finished']:
+                part = 1.0
+            else:
+                part = min(done / size, 1.0) if size else 0.0
+            sizes = state['sizes']
+            if sizes is not None and sum(sizes) <= 0:
+                sizes = None
+            if sizes:
+                within_pass = (sum(sizes[:state['archive']]) + part * sizes[state['archive']]) / sum(sizes)
+            else:
+                within_pass = (state['archive'] + part) / self.archives
+            fraction = min((state['pass'] + within_pass) / self.passes, 0.999)
+            percentage = f'{"" if sizes else "~"}{fraction * 100:.1f}%'
+            if not size and not state['finished']:
+                percentage = f'>={fraction * 100:.1f}%' if fraction else '--%'
+            description = state['stage']
+            if self.archives > 1:
+                description += f' {state["archive"] + 1}/{self.archives}'
+            if not sizes:
+                description += ', estimated by archive' if self.archives > 1 else ', estimated'
+            if not size and not state['finished']:
+                description += ', size unknown'
+        if width is None:
+            return f'Total {percentage} ({description})'
+        cells = max(8, min(32, width - 25))
+        filled = int(fraction * cells)
+        bar = '#' * filled + '-' * (cells - filled)
+        return f'Total [{bar}] {percentage} ({description})'
 
     def report(self):
         # Skip status ticks while a prompt owns the terminal. Other logs and
@@ -339,10 +393,11 @@ class Progress:
         rate = (transferred - self.last_bytes) / max(now - self.last_time, 0.001) / 1024**2
         read_rate = (read_bytes - self.last_read_bytes) / max(now - self.last_time, 0.001) / 1024**2
         average = transferred / max(now - self.started, 0.001) / 1024**2
-        done = written_bytes - self.eta_base
+        done = self.overall['done'] if self.overall is not None else written_bytes - self.eta_base
         if self.phase == "complete":
             eta = "00:00:00"
-        elif 'backup completion' in self.phase or self.phase == 'writing metadata file':
+        elif ('backup completion' in self.phase or self.phase == 'writing metadata file' or
+              self.phase.startswith(('flushing restored', 'flushing updated', 'finalizing '))):
             eta = 'finalizing'
         elif not self.total_bytes or not done:
             eta = "calculating"
@@ -353,8 +408,11 @@ class Progress:
             eta = f"~{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
         if sys.stderr.isatty():
             label = f'Backup {self.label[:12]}' if re.fullmatch('[0-9a-f]{32}', self.label) else self.label
-            rows = [f'{label} | {self.phase}',
-                    f'Read {readable_size(read_bytes, "GiB")}  |  Delivered {readable_size(written_bytes, "GiB")}']
+            width = terminal_width(sys.stderr)
+            rows = [f'{label} | {self.phase}']
+            if total := self.total_progress(width):
+                rows.append(total)
+            rows.append(f'Read {readable_size(read_bytes, "GiB")}  |  Delivered {readable_size(written_bytes, "GiB")}')
             if self.buffer_size is not None:
                 rows[-1] += f'  |  Committed {readable_size(self.durable_bytes, "GiB")}'
                 rows.append(f'Buffer {readable_size(self.buffer_size)} each  |  '
@@ -364,7 +422,6 @@ class Progress:
             rows.append(f'I/O {rate:.1f} MiB/s  |  Average {average:.1f} MiB/s  |  '
                         f'Elapsed {readable_duration(now - self.started)}')
             rows.append(f'ETA {eta} (current archive)')
-            width = terminal_width(sys.stderr)
             lines = []
             for index, row in enumerate(rows):
                 lines.extend(textwrap.wrap(display_text(row), width=width,
@@ -380,11 +437,13 @@ class Progress:
                        f"committed {self.durable_bytes / 1024**2:.1f} MiB; ")
         reader = (f"reader {self.reader_state}, {read_rate:.1f} MiB/s source; "
                   if self.reader_state is not None else "")
+        total = self.total_progress()
         log(f"{self.label}: {self.phase}; {read_bytes / 1024**2:.1f} MiB read, "
             f"{written_bytes / 1024**2:.1f} MiB delivered; "
             f"{buffer}{reader}"
             f"{rate:.1f} MiB/s I/O, {average:.1f} MiB/s average; "
-            f"ETA {eta} (current archive); {now - self.started:.0f}s elapsed")
+            f"ETA {eta} (current archive); {now - self.started:.0f}s elapsed"
+            f"{'; ' + total if total else ''}")
         self.last_time, self.last_bytes = now, transferred
         self.last_read_bytes = read_bytes
 
@@ -632,6 +691,7 @@ class Volume:
         self.position_disabled = False
         self.record_bytes = 0
         self.prefetched = None
+        self.first_header_sha256 = None
 
     def control(self, operation, count=1):
         fcntl.ioctl(self.stream.fileno(), MTIOCTOP, struct.pack("@hi", operation, count))
@@ -710,6 +770,8 @@ class Volume:
                 self.record_bytes += len(record)
                 if len(record) != BLOCK_SIZE:
                     raise BackupError("Truncated tape record; cannot locate a safe boundary")
+                if self.physical and before == 0:
+                    self.first_header_sha256 = hashlib.sha256(record).hexdigest()
                 return record
             if not self.physical or self.position() == before:
                 return None
@@ -1156,14 +1218,108 @@ class TapeMedia:
                 # Buffered r+ requires seeking, which terminals do not support.
                 with OUTPUT_LOCK, open("/dev/tty", "r") as tty_in, open("/dev/tty", "w") as tty_out:
                     purpose = ('continuation' if number > 1 else 'write') if action == 'blank' else action
-                    tty_out.write(f"Load {label} into {self.device} for {purpose}{warning}.\n"
-                                  "Press Enter when ready, or type q to stop: ")
-                    tty_out.flush()
-                    response = tty_in.readline()
+                    while True:
+                        choices = 'wipe to short-erase the loaded tape, or ' if action == 'blank' else ''
+                        tty_out.write(f"Load {label} into {self.device} for {purpose}{warning}.\n"
+                                      f"Press Enter when ready, or type {choices}q to stop: ")
+                        tty_out.flush()
+                        response = tty_in.readline()
+                        if not response or response.strip().lower() == 'q':
+                            raise BackupError('Media change cancelled; the streaming operation is incomplete')
+                        if not response.strip():
+                            return
+                        if action == 'blank' and response.strip().lower() == 'wipe':
+                            try:
+                                if self.wipe_at_prompt(backup_id, tty_in, tty_out):
+                                    return
+                            except (BackupError, OSError) as exc:
+                                tty_out.write(f'Wipe refused or failed: {display_text(exc)}.\n'
+                                              'Backup remains active; buffered data is retained. '
+                                              'Replace the cartridge or retry.\n')
+                        else:
+                            tty_out.write('Unrecognized response; tape was not changed.\n')
             except OSError as exc:
                 raise BackupError(f"No terminal for tape changes; use --media-command ({exc})") from exc
-            if not response or response.strip().lower() == "q":
-                raise BackupError("Media change cancelled; the streaming operation is incomplete")
+
+    def protect_cartridge(self, volume):
+        """Remember the first record even when appending after older backups."""
+        if volume.first_header_sha256 is not None:
+            # Catalog validation or base scanning already read this record.
+            # Reuse it rather than traversing the cartridge again just to hash it.
+            self.protected_headers.add(volume.first_header_sha256)
+            return
+        position, used = volume.position(), volume.record_bytes
+        try:
+            volume.seek_position(0)
+            record = volume.next_record()
+            if record is None:
+                raise BackupError('Cannot identify the append cartridge for wipe protection')
+            self.protected_headers.add(hashlib.sha256(record).hexdigest())
+        finally:
+            volume.seek_position(position)
+            volume.record_bytes = used
+
+    def wipe_at_prompt(self, backup_id, tty_in, tty_out):
+        """Short erase under the active backup's lock, retaining its RAM buffers."""
+        tty_out.write('Checking the loaded cartridge before offering erase confirmation...\n')
+        tty_out.flush()
+        self.mt('rewind')
+        self.mt('setblk', '0')
+        volume = self.raw_open(True)
+        try:
+            record = volume.next_record()
+            if record is not None:
+                if hashlib.sha256(record).hexdigest() in getattr(self, 'protected_headers', set()):
+                    raise BackupError('This cartridge is already part of the active backup or its '
+                                      'append base; it cannot be wiped here')
+                if record.startswith((MAGIC, ZFS_MAGIC)):
+                    header = decoded_header(record)
+                    if header.get('type') != 'volume' or not isinstance(header.get('backup'), dict):
+                        raise BackupError('Cannot identify the cartridge from its first header')
+                    identifier = valid_id(header['backup'].get('id'))
+                    if type(header.get('volume')) is not int or header['volume'] < 1:
+                        raise BackupError('Invalid volume number in cartridge header')
+                    if identifier in getattr(self, 'protected_backup_ids', {backup_id}):
+                        raise BackupError('This cartridge contains a volume of the active backup or its base; '
+                                          'it cannot be wiped here')
+                    tty_out.write(f"Loaded tape starts with backup {identifier}, volume {header['volume']}.\n")
+            tty_out.write(f'DESTROY ALL recorded backups on the loaded tape in {self.device} '
+                          'with a short erase, then continue this backup.\n'
+                          'Type WIPE to confirm, or anything else to return to the tape prompt: ')
+            tty_out.flush()
+            if tty_in.readline().strip() != 'WIPE':
+                tty_out.write('Wipe cancelled; tape was not erased.\n')
+                return False
+            # Recheck after the human wait in case the cartridge was swapped.
+            # Check and erase on the same descriptor, with no external lock gap.
+            volume.control(MTREW)
+            if volume.next_record() != record:
+                raise BackupError('Cartridge changed during wipe confirmation; nothing was erased')
+            volume.control(MTREW)
+            tty_out.write('Short erase in progress; backup buffers are retained...\n')
+            tty_out.flush()
+            self.erase_volume(volume)
+            tty_out.write('Blank tape verified; continuing backup on this cartridge.\n')
+            tty_out.flush()
+            return True
+        finally:
+            volume.close()
+
+    def erase_volume(self, volume, *, long_erase=False, progress=None):
+        mode = 'long erase' if long_erase else 'short erase'
+        try:
+            volume.control(MTERASE, 1 if long_erase else 0)
+            volume.control(MTREW)
+        except OSError as exc:
+            raise OSError(exc.errno, f'{mode} failed on {self.device}: {exc.strerror or exc}') from exc
+        if progress:
+            progress.phase = 'verifying blank tape'
+        try:
+            volume.require_blank()
+        except (BackupError, OSError) as exc:
+            raise BackupError(f'Erase returned, but blank verification failed on {self.device}: {exc}') from exc
+        self.loaded = False
+        self.entries = []
 
     def load(self, backup_id, number, writing):
         if not writing and getattr(self, 'loaded', False):
@@ -1291,22 +1447,9 @@ class TapeMedia:
             volume = self.raw_open(True)
             try:
                 progress.phase = mode
-                try:
-                    # Explicit count: 0 is short erase; 1 requests long erase.
-                    # Keep the descriptor open until blank verification ends.
-                    volume.control(MTERASE, 1 if long_erase else 0)
-                    volume.control(MTREW)
-                except OSError as exc:
-                    raise OSError(exc.errno, f'{mode} failed on {self.device}: {exc.strerror or exc}') from exc
-                progress.phase = 'verifying blank tape'
-                try:
-                    volume.require_blank()
-                except (BackupError, OSError) as exc:
-                    raise BackupError(f'Erase returned, but blank verification failed on {self.device}: {exc}') from exc
+                self.erase_volume(volume, long_erase=long_erase, progress=progress)
             finally:
                 volume.close()
-            self.loaded = False
-            self.entries = []
             progress.phase = 'blank verified; rewound and left loaded'
 
     def cartridges(self):
@@ -1330,6 +1473,8 @@ class StreamWriter:
 
     def __init__(self, media, job, volume_size, progress, buffer_size=DEFAULT_BUFFER):
         self.media, self.job = media, job
+        self.media.protected_headers = set()
+        self.media.protected_backup_ids = {job['id'], job.get('parent')} - {None}
         self.volume_size, self.progress = volume_size, progress
         self.replay_limit = max(2 * BLOCK_SIZE, buffer_size)
         if volume_size:
@@ -1366,6 +1511,10 @@ class StreamWriter:
         self.committed_frames = 0
         self.progress.phase = f"load volume {self.number}"
         prepared = getattr(self.media, 'append_volume', None) if self.number == 1 else None
+        if prepared is not None and prepared.physical:
+            # Protect the base even if the size limit moves this incremental's
+            # first segment to another cartridge before any data is appended.
+            self.media.protect_cartridge(prepared)
         self.media.append_volume = None
         if prepared is not None and self.volume_size and prepared.record_bytes + 4 * BLOCK_SIZE > self.volume_size:
             log('No room for a new backup segment under the cartridge size limit; load fresh media')
@@ -1424,6 +1573,8 @@ class StreamWriter:
                                           "replay_bytes": self.replay_limit})
         with self.startup_operation('writing header for'):
             self.volume.write(header)
+        if position == 0 and self.volume.physical:
+            self.media.protected_headers.add(hashlib.sha256(header).hexdigest())
         with self.startup_operation('committing header for'):
             self.volume.commit()
         self.media.entries.append({'id': self.job['id'], 'volume': self.number,
@@ -1536,6 +1687,7 @@ class StreamWriter:
             self.recover(exc)
         if kind == "data":
             self.progress.written_bytes += len(data)
+            self.progress.advance(len(data))
         self.progress.phase = f"streaming to volume {self.number}"
 
     def finish(self):
@@ -1867,18 +2019,25 @@ def inspect_backup(media, backup_id=None):
         reader.close()
 
 
-def scan(media, backup_id=None, snapshot_fd=None, *, verify=True):
-    with Progress("Reading tape metadata" if not verify else "Verifying backup") as progress:
+def scan(media, backup_id=None, snapshot_fd=None, *, verify=True, progress=None):
+    own_progress = progress is None
+    context = Progress("Reading tape metadata" if not verify else "Verifying backup") if own_progress else nullcontext(progress)
+    with context as progress:
         reader = StreamReader(media, backup_id, progress)
         try:
+            reader.next_volume()
             progress.phase = "reading tapes"
+            progress.estimate(reader.job.get('estimated_bytes'))
             for kind, payload in reader.frames(skip_data=not verify):
                 if payload is not None:
                     progress.read_bytes += len(payload)
+                    if kind == 'data':
+                        progress.advance(len(payload))
                 if kind == "snapshot" and snapshot_fd is not None:
                     with os.fdopen(os.dup(snapshot_fd), "ab", buffering=0) as snapshot:
                         snapshot.write(payload)
-            progress.phase = "complete"
+            if own_progress:
+                progress.phase = "complete"
             return reader.summary
         finally:
             reader.close()
@@ -2265,7 +2424,8 @@ def restore_zfs(backup_ids, dataset, media):
         raise BackupError('OpenZFS zfs command is required on the restore machine')
     for backup_id in backup_ids:
         valid_id(backup_id)
-    with restore_lock(dataset, zfs=True), media.lock():
+    with restore_lock(dataset, zfs=True), media.lock(), \
+            Progress('ZFS restore', archives=len(backup_ids), passes=2) as progress:
         exists = zfs_target_exists(dataset)
         previous_id = None
         if exists:
@@ -2281,8 +2441,9 @@ def restore_zfs(backup_ids, dataset, media):
                 raise BackupError('Existing ZFS destination is not a completed tape-backup restore; choose a new dataset')
         verified, previous = {}, None
         # Verify every requested stream before any receive can alter a dataset.
-        for backup_id in backup_ids:
-            summary = scan(media, backup_id)
+        for index, backup_id in enumerate(backup_ids):
+            progress.track_archive(None, archive=index, stage='verification')
+            summary = scan(media, backup_id, progress=progress)
             if summary.get('archive_type') != 'zfs':
                 raise BackupError('zfs-restore requires native ZFS backups; use restore for tar archives')
             metadata = validate_zfs_metadata(summary.get('zfs'))
@@ -2298,53 +2459,58 @@ def restore_zfs(backup_ids, dataset, media):
                 check_zfs_base(dataset, metadata)
             verified[backup_id] = summary
             previous, previous_id = summary, backup_id
-        with Progress('ZFS restore') as progress:
-            for backup_id in backup_ids:
-                reader, process = StreamReader(media, backup_id, progress), None
-                try:
-                    reader.next_volume()
-                    expected = verified[backup_id]
-                    if any(expected.get(k) != v for k, v in reader.job.items()):
-                        raise BackupError('ZFS backup header changed after verification')
-                    metadata = validate_zfs_metadata(reader.job.get('zfs'))
-                    if exists:
-                        state = zfs_properties(dataset, [ZFS_RESTORE_PROPERTY, 'mounted', 'readonly'])
-                        if (state[ZFS_RESTORE_PROPERTY] != reader.job['parent'] or
-                                state['mounted'] != 'no' or state['readonly'] != 'on'):
-                            raise BackupError('ZFS destination changed after verification')
-                        check_zfs_base(dataset, metadata)
-                        run_command(['zfs', 'set', f'{ZFS_RESTORE_PROPERTY}=pending:{backup_id}', dataset])
-                    elif zfs_target_exists(dataset):
-                        raise BackupError('ZFS destination appeared after verification; refusing to overwrite it')
-                    progress.phase = f'receiving {backup_id} into {dataset}'
-                    progress.estimate(reader.job.get('estimated_bytes'))
-                    # Never use -F or mount the received filesystem. Explicit
-                    # properties prevent incoming mount/share settings taking effect.
-                    command = ['zfs', 'receive', '-u', '-o', 'readonly=on',
-                               '-o', 'canmount=off', '-o', 'mountpoint=none',
-                               '-o', 'sharenfs=off', '-o', 'sharesmb=off',
-                               '-o', f'{ZFS_RESTORE_PROPERTY}=pending:{backup_id}', dataset]
-                    process = logged_process(command, stdin=subprocess.PIPE,
-                                             log_stdout=True, env=external_env())
-                    for kind, payload in reader.frames():
-                        if kind == 'data':
-                            process.stdin.write(payload)
-                            progress.read_bytes += len(payload)
-                            progress.written_bytes += len(payload)
-                    process.stdin.close()
-                    if process.wait():
-                        raise BackupError('ZFS receive failed; destination may be incomplete. No rollback was requested')
-                    if reader.summary != expected:
-                        raise BackupError('ZFS stream changed between verification and receive')
-                    received = dataset + '@' + metadata['snapshot'].split('@', 1)[1]
-                    if zfs_properties(received, ['guid'])['guid'] != metadata['guid']:
-                        raise BackupError('Received ZFS snapshot GUID differs from the backup')
-                    run_command(['zfs', 'set', f'{ZFS_RESTORE_PROPERTY}={backup_id}', dataset])
-                    exists = True
-                finally:
-                    stop_process(process)
-                    reader.close()
-            progress.phase = 'complete'
+            progress.finish_archive()
+        sizes = [verified[backup_id]['data_bytes'] for backup_id in backup_ids]
+        for index, backup_id in enumerate(backup_ids):
+            progress.track_archive(sizes[index], archive=index, pass_number=1,
+                                   stage='restore', sizes=sizes)
+            reader, process = StreamReader(media, backup_id, progress), None
+            try:
+                reader.next_volume()
+                expected = verified[backup_id]
+                if any(expected.get(k) != v for k, v in reader.job.items()):
+                    raise BackupError('ZFS backup header changed after verification')
+                metadata = validate_zfs_metadata(reader.job.get('zfs'))
+                if exists:
+                    state = zfs_properties(dataset, [ZFS_RESTORE_PROPERTY, 'mounted', 'readonly'])
+                    if (state[ZFS_RESTORE_PROPERTY] != reader.job['parent'] or
+                            state['mounted'] != 'no' or state['readonly'] != 'on'):
+                        raise BackupError('ZFS destination changed after verification')
+                    check_zfs_base(dataset, metadata)
+                    run_command(['zfs', 'set', f'{ZFS_RESTORE_PROPERTY}=pending:{backup_id}', dataset])
+                elif zfs_target_exists(dataset):
+                    raise BackupError('ZFS destination appeared after verification; refusing to overwrite it')
+                progress.phase = f'receiving {backup_id} into {dataset}'
+                # Never use -F or mount the received filesystem. Explicit
+                # properties prevent incoming mount/share settings taking effect.
+                command = ['zfs', 'receive', '-u', '-o', 'readonly=on',
+                           '-o', 'canmount=off', '-o', 'mountpoint=none',
+                           '-o', 'sharenfs=off', '-o', 'sharesmb=off',
+                           '-o', f'{ZFS_RESTORE_PROPERTY}=pending:{backup_id}', dataset]
+                process = logged_process(command, stdin=subprocess.PIPE,
+                                         log_stdout=True, env=external_env())
+                for kind, payload in reader.frames():
+                    if kind == 'data':
+                        process.stdin.write(payload)
+                        progress.read_bytes += len(payload)
+                        progress.written_bytes += len(payload)
+                        progress.advance(len(payload))
+                process.stdin.close()
+                progress.phase = 'finalizing ZFS receive'
+                if process.wait():
+                    raise BackupError('ZFS receive failed; destination may be incomplete. No rollback was requested')
+                if reader.summary != expected:
+                    raise BackupError('ZFS stream changed between verification and receive')
+                received = dataset + '@' + metadata['snapshot'].split('@', 1)[1]
+                if zfs_properties(received, ['guid'])['guid'] != metadata['guid']:
+                    raise BackupError('Received ZFS snapshot GUID differs from the backup')
+                run_command(['zfs', 'set', f'{ZFS_RESTORE_PROPERTY}={backup_id}', dataset])
+                exists = True
+                progress.finish_archive()
+            finally:
+                stop_process(process)
+                reader.close()
+        progress.phase = 'complete'
     return dataset
 
 
@@ -2723,8 +2889,8 @@ def write_backup(source, media, level, base, volume_size, buffer_size, quiet,
         f"buffer {buffer_size / 1024**2:g} MiB; continuous writes, "
         f"{frame_size / 1024**2:g} MiB frames, background reader; "
         "no disk archive or state directory")
-    with Progress(job["id"], buffer_size=buffer_size) as progress, ram_snapshot() as metadata_snapshot:
-        progress.estimate(estimated_bytes)
+    with Progress(job["id"], buffer_size=buffer_size, archives=1) as progress, ram_snapshot() as metadata_snapshot:
+        progress.track_archive(estimated_bytes)
         writer = StreamWriter(media, job, volume_size, progress, buffer_size)
         process = None
         try:
@@ -2760,6 +2926,7 @@ def write_backup(source, media, level, base, volume_size, buffer_size, quiet,
                    "snapshot_bytes": snapshot_bytes, "snapshot_sha256": snapshot_hash.hexdigest(),
                    "chunks": writer.sequence}
             writer.send("end", json.dumps(end, sort_keys=True).encode())
+            progress.finish_archive()
             writer.finish()
             progress.phase = 'writing metadata file'
             metadata_complete, append_ready, warnings = False, True, []
@@ -2885,7 +3052,9 @@ def extract_restore_stream(reader, tree, progress, quiet):
                 process.stdin.write(payload)
                 progress.read_bytes += len(payload)
                 progress.written_bytes += len(payload)
+                progress.advance(len(payload))
         process.stdin.close()
+        progress.phase = 'finalizing archive extraction'
         if process.wait():
             raise BackupError('GNU tar extraction failed')
     finally:
@@ -2910,7 +3079,7 @@ def restore(backup_ids, destination, media, *, quiet=False, base=None):
     destination.parent.mkdir(parents=True, exist_ok=True)
     tree = None
     try:
-        with restore_lock(destination), media.lock(), Progress("Restore") as progress:
+        with restore_lock(destination), media.lock(), Progress("Restore", archives=len(backup_ids)) as progress:
             parent = read_restore_marker(destination)
             expected_history = parent
             if parent is not None and base and parent['id'] != base:
@@ -2923,6 +3092,7 @@ def restore(backup_ids, destination, media, *, quiet=False, base=None):
                 parent = inspect_backup(media, base)
                 log(f'Using explicitly supplied restored base {base} for {destination}')
             inplace = parent is not None
+            progress.passes = 2 if inplace else 1
             if not inplace:
                 try:
                     empty_destination(destination)
@@ -2940,7 +3110,8 @@ def restore(backup_ids, destination, media, *, quiet=False, base=None):
             verified = {}
             if inplace:
                 previous = parent
-                for backup_id in backup_ids:
+                for index, backup_id in enumerate(backup_ids):
+                    progress.track_archive(None, archive=index, stage='verification')
                     reader = StreamReader(media, backup_id, progress)
                     try:
                         reader.next_volume()
@@ -2950,11 +3121,16 @@ def restore(backup_ids, destination, media, *, quiet=False, base=None):
                         for kind, payload in reader.frames():
                             if kind == 'data':
                                 progress.read_bytes += len(payload)
+                                progress.advance(len(payload))
                         verified[backup_id] = reader.summary
+                        progress.finish_archive()
                         previous = reader.job
                     finally:
                         reader.close()
-            for backup_id in backup_ids:
+            sizes = [verified[backup_id]['data_bytes'] for backup_id in backup_ids] if inplace else None
+            for index, backup_id in enumerate(backup_ids):
+                progress.track_archive(sizes[index] if sizes else None, archive=index,
+                                       pass_number=1 if inplace else 0, stage='restore', sizes=sizes)
                 reader = StreamReader(media, backup_id, progress)
                 try:
                     reader.next_volume()
@@ -2972,7 +3148,7 @@ def restore(backup_ids, destination, media, *, quiet=False, base=None):
                         write_restore_marker(destination, parent, pending=backup_id)
                     log(f"Restoring {backup_id} ({job['level']}) directly from tape")
                     progress.phase = f"extracting {backup_id}"
-                    progress.estimate(job.get("estimated_bytes"))
+                    progress.estimate(sizes[index] if sizes else job.get('estimated_bytes'))
                     extract_restore_stream(reader, destination if inplace else tree, progress, quiet)
                     if inplace:
                         if reader.summary != verified[backup_id]:
@@ -2984,6 +3160,7 @@ def restore(backup_ids, destination, media, *, quiet=False, base=None):
                         write_restore_marker(destination, job)
                         expected_history = restore_job(job)
                     parent = job
+                    progress.finish_archive()
                 except BaseException:
                     if inplace:
                         log('Incremental restore stopped. If application began, the directory is marked '

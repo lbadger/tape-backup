@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import pty
 from pathlib import Path
 import shlex
 import shutil
@@ -52,18 +53,20 @@ class BinaryTests(unittest.TestCase):
         self.assertIn("./", self.last_stderr)
         self.assertIn("MiB/s", self.last_stderr)
         self.assertIn("ETA", self.last_stderr)
+        self.assertIn('Total 100.0% (complete)', self.last_stderr)
         expected = {p.name: p.read_bytes() for p in self.source.iterdir()}
         actual = {p.name: p.read_bytes() for p in (self.root / "restored").iterdir()}
         self.assertEqual(actual, expected)
 
     def test_relocated_binary_without_python_full_and_incremental_restore(self):
-        self.assertEqual(self.run_binary("--version"), "tape-backup 2.0.1")
+        self.assertEqual(self.run_binary("--version"), "tape-backup 2.1.0")
         self.assertIn("/dev/nst0", self.run_binary("backup", "--help"))
         self.assertNotIn('--volume-size', self.run_binary('backup', '--help'))
         full = self.run_binary(*self.backup_args)
         self.assertIn("./change", self.last_stderr)
         self.assertIn("MiB/s", self.last_stderr)
         self.assertIn("ETA", self.last_stderr)
+        self.assertIn('Total 100.0% (complete)', self.last_stderr)
         self.assertGreater(len(list(self.media.glob(f"{full}.*.tape"))), 1)
         names = self.run_binary('list', '--media-dir', self.media).splitlines()
         self.assertEqual(set(names), {'./', './keep', './change', './remove'})
@@ -82,6 +85,36 @@ class BinaryTests(unittest.TestCase):
         self.assertFalse(list(self.root.rglob("*.snar")))
         self.assertEqual(list(self.root.rglob('*.json')),
                          [tb.restore_marker_path(self.root / 'restored')])
+
+    def test_binary_displays_total_bar_for_backup_and_restore_on_a_terminal(self):
+        def run(*args):
+            master, slave = pty.openpty()
+            try:
+                result = subprocess.run([str(self.binary), *map(str, args)], cwd=self.root,
+                                        env=self.env, stdout=subprocess.PIPE, stderr=slave,
+                                        text=True, timeout=30)
+                os.close(slave)
+                slave = None
+                chunks = []
+                while True:
+                    try:
+                        data = os.read(master, 4096)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    chunks.append(data)
+                text = b''.join(chunks).decode()
+                self.assertEqual(result.returncode, 0, text)
+                self.assertRegex(text, r'Total \[#+\] 100\.0%\s+\(complete\)')
+                return result.stdout.strip()
+            finally:
+                os.close(master)
+                if slave is not None:
+                    os.close(slave)
+        full = run(*self.backup_args, '--quiet')
+        run('restore', '--backup', full, '--destination', self.root / 'restored',
+            '--media-dir', self.media, '--quiet')
 
     def test_binary_rejects_incomplete_backup_and_can_start_again(self):
         wrapper = self.tools / "tar"

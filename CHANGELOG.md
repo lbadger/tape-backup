@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.1.0 — 2026-09-24
+
+- Add `wipe` at interactive blank-cartridge prompts, followed by a separate
+  `WIPE` confirmation. Short-erase and verify the loaded tape under the active
+  backup's drive lock, retaining the source stream, volume number, and RAM buffers.
+- Refuse in-prompt erasure of active backup/base headers and remembered cartridges
+  already used by the job. Recheck the header after confirmation. Cancellation
+  and erase failures return to the load prompt; Enter never authorizes an erase.
+- Add total progress bars for tar and native ZFS backups/restores, spanning tape
+  changes and requested restore chains. Include existing verification passes,
+  use verified sizes during apply, label estimates, and reserve 100% for success.
+  Redirected logs show percentages; prompts continue to suppress background logs.
+- Add multi-cartridge wipe/restore regressions, append-base protection tests,
+  confirmation/drive-error tests, progress accounting, and standalone terminal
+  checks. Tape formats and the SSH protocol are unchanged.
+
 ## 2.0.1 — 2026-09-24
 
 - Share restore destination locks across home directories and accounts, including

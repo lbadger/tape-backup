@@ -55,6 +55,11 @@ preserve those while making operation and recovery easier to understand.
 
 ## Evidence and current strengths
 
+**v2.1.0** adds confirmed short erase inside the active backup's blank-cartridge
+prompt and overall backup/restore progress. Regressions cover preserving RAM
+continuation state, protecting earlier volumes and append bases, handling erase
+errors without ending the backup, and progress across restore chains and passes.
+
 Follow-up review for **v2.0.1** found and fixed three additional issues:
 restore locks depended on `$HOME`, continuation reads could rescan the exhausted
 cartridge, and inventory exclusion matching differed from GNU tar. Regressions

@@ -207,7 +207,10 @@ class ZFSKernelTests(unittest.TestCase):
         delta = tb.backup_zfs(self.snapshot('two'), self.media, base=full, buffer_size=tb.BLOCK_SIZE,
                               volume_size=512 * 1024)
         destination = self.dataset + '/all'
-        tb.restore_zfs([full, delta], destination, self.media)
+        output = io.StringIO()
+        with redirect_stderr(output):
+            tb.restore_zfs([full, delta], destination, self.media)
+        self.assertEqual(output.getvalue().count('Total 100.0% (complete)'), 1)
         self.assertEqual(tree_contents(self.view(destination, 'all')), tree_contents(self.source))
         steps = self.dataset + '/steps'
         tb.restore_zfs([full], steps, self.media)
