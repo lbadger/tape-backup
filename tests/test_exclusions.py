@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shlex
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -108,6 +109,45 @@ class ExclusionTests(unittest.TestCase):
         for patterns in (['/opt/cache'], ['../secret'], ['.'], [''], ['x\0y'], ['a' * 17000]):
             with self.subTest(patterns=str(patterns)[:40]), self.assertRaises(tb.BackupError):
                 tb.normalize_exclusions(patterns)
+
+    def test_inventory_matching_agrees_with_real_tar_for_escapes_and_character_classes(self):
+        cases = [(r'cache\*', 'cache*'), (r'cache\*', r'cache\data'),
+                 ('[[:digit:]]*', '1cache'), ('[^a]*', 'bcache'),
+                 ('[!a]*', 'acache'), ('[a-c]*', 'bcache'),
+                 ('trailing\\', 'trailing\\'), (r'back\\slash', r'back\slash'),
+                 ('[[]name', '[name'), ('[[:alpha:]]*', 'éclair'),
+                 ('?', 'é'), ('unclosed[', 'unclosed[')]
+        for index, (pattern, name) in enumerate(cases):
+            with self.subTest(pattern=pattern, name=name), tb.ram_snapshot() as snapshot:
+                source = self.root / f'matching-{index}'
+                (source / name).mkdir(parents=True)
+                (source / name / 'secret').write_text('excluded only if the pattern matches')
+                (source / 'kept-file').write_text('keep')
+                process = tb.start_archive(source, snapshot, True, [pattern])
+                try:
+                    data = process.stdout.read()
+                    self.assertEqual(process.wait(), 0)
+                finally:
+                    tb.stop_process(process)
+                with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+                    archived = './' + name + '/secret' in archive.getnames()
+                self.assertEqual(tb.is_excluded(name, [pattern]), not archived)
+
+    def test_posix_character_class_prunes_unreadable_directory_before_backup(self):
+        excluded = self.source / '1cache'
+        excluded.mkdir()
+        (excluded / 'secret').write_text('do not archive')
+        excluded.chmod(0)
+        self.addCleanup(excluded.chmod, 0o700)
+        # Observe traversal too: chmod alone cannot enforce this when CI runs as root.
+        original_scandir = os.scandir
+        def scandir(path):
+            if Path(path) == excluded:
+                raise AssertionError('Inventory entered an excluded directory')
+            return original_scandir(path)
+        with patch.object(tb.os, 'scandir', scandir):
+            full = self.create(excludes=['[[:digit:]]*'])
+        self.assertTrue(tb.scan(self.media, full)['data_verified'])
 
 
 if __name__ == '__main__':

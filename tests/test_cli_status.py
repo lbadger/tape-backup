@@ -20,6 +20,11 @@ from unittest.mock import patch
 import tape_backup as tb
 
 
+class TerminalOutput(io.StringIO):
+    def isatty(self):
+        return True
+
+
 class CLIStatusTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -112,6 +117,75 @@ class CLIStatusTests(unittest.TestCase):
         self.assertEqual(result['position'], (5, 5))
         with self.assertRaises(OSError):
             os.fstat(opened[0])
+
+    def test_status_formats_terminal_details_and_preserves_explicit_and_piped_json(self):
+        status = {'device': '/dev/nst0', 'busy': False, 'state': {'online': True},
+                  'vendor': 'HP', 'model': 'Ultrium 6', 'rev': '1234',
+                  'compression': None, 'position': None, 'file_number': -1, 'block_number': -1,
+                  'statistics': {'write_byte_cnt': 2 * 1024**4, 'in_flight': 0},
+                  'warnings': [], 'recommendations': []}
+        for stream, options, expect_json in ((TerminalOutput(), [], False),
+                (TerminalOutput(), ['--json'], True), (io.StringIO(), [], True),
+                (io.StringIO(), ['--text'], False)):
+            with self.subTest(options=options, terminal=stream.isatty()), redirect_stdout(stream), \
+                    patch.object(tb, 'TapeMedia'), patch.object(tb, 'device_status', return_value=status):
+                self.assertEqual(tb.main(['status', *options]), 0)
+            text = stream.getvalue()
+            if expect_json:
+                self.assertEqual(json.loads(text), status)
+            else:
+                for value in ('Tape drive: /dev/nst0', 'HP Ultrium 6', '2.00 TiB', 'Unknown / Unknown'):
+                    self.assertIn(value, text)
+                self.assertRegex(text, r'Compression:\s+Unknown')
+                self.assertNotIn('Compression: Off', text)
+
+    def test_info_alias_and_text_inspection_do_not_claim_payload_verification(self):
+        code, backup = self.backup()
+        self.assertEqual(code, 0)
+        for command in ('inspect', 'info'):
+            output = TerminalOutput()
+            with redirect_stdout(output), redirect_stderr(io.StringIO()):
+                self.assertEqual(tb.main([command, '--media-dir', str(self.root / 'media')]), 0)
+            text = output.getvalue()
+            self.assertIn(backup['id'], text)
+            self.assertIn('Listing complete', text)
+            self.assertIn('Not verified; run verify', text)
+        output = io.StringIO()
+        with redirect_stdout(output), redirect_stderr(io.StringIO()):
+            self.assertEqual(tb.main(['verify', '--backup', backup['id'], '--media-dir',
+                                     str(self.root / 'media'), '--text']), 0)
+        self.assertIn('Verified backup', output.getvalue())
+        with next((self.root / 'media').glob('*.tape')).open('ab') as tape:
+            tape.write(b'incomplete tail')
+        output = io.StringIO()
+        with redirect_stdout(output), redirect_stderr(io.StringIO()):
+            self.assertEqual(tb.main(['info', '--media-dir', str(self.root / 'media'), '--text']), 1)
+        self.assertIn('Listing incomplete', output.getvalue())
+        self.assertIn(backup['id'], output.getvalue())
+        self.assertIn('Reason:', output.getvalue())
+
+    def test_terminal_progress_fits_width_and_final_flush_does_not_show_zero_eta(self):
+        output = TerminalOutput()
+        progress = tb.Progress('a' * 32, buffer_size=1024**3)
+        progress.phase = 'flushing volume 1 (backup completion)'
+        progress.read_bytes = progress.written_bytes = 1531559 * 1024**2
+        progress.transferred = progress.read_bytes
+        progress.durable_bytes = progress.read_bytes - 128 * 1024**2
+        progress.reader_state = 'finished'
+        with redirect_stderr(output), patch.object(tb, 'terminal_width', return_value=72):
+            progress.report()
+        text = output.getvalue()
+        for value in ('Backup aaaaaaaaaaaa', 'Buffer 1.00 GiB each', '1,495.66 GiB',
+                      'Committed', 'MiB/s', 'Elapsed', 'ETA finalizing'):
+            self.assertIn(value, text)
+        self.assertTrue(all(len(line) <= 72 for line in text.splitlines()))
+        self.assertNotIn('ETA 00:00:00', text)
+
+    def test_text_output_escapes_terminal_control_sequences_in_source_paths(self):
+        result = {'id': 'a' * 32, 'level': 'full', 'source': '/opt/\x1b[2Jsecret\nnew-row'}
+        text = tb.format_backup_info(result)
+        self.assertIn(r'\x1b[2Jsecret\x0anew-row', text)
+        self.assertNotIn('\x1b', text)
 
     def test_sigterm_stops_source_and_reports_an_incomplete_backup(self):
         tools = self.root / 'tools'

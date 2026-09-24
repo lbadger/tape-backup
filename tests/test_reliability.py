@@ -4,6 +4,8 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -69,6 +71,32 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(media.attempts, 2)
         self.assertFalse(list(self.root.glob('.restored.restoring-*')))
 
+    def test_continuation_requests_next_cartridge_without_rewinding_or_reading_previous(self):
+        media = TapeMedia()
+        full = self.create(media, cap=8 * tb.BLOCK_SIZE)
+        media.loaded = False
+        original_next = tb.StreamReader.next_volume
+        original_request = media.request
+        previous = []
+        transitions = []
+        def next_volume(reader):
+            if reader.number:
+                previous[:] = [(media.active, media.active.cursor, media.active.reads)]
+            return original_next(reader)
+        def request(backup_id, number, action):
+            if number > 1 and action == 'read':
+                tape, cursor, reads = previous[0]
+                self.assertIs(media.active, tape)
+                self.assertEqual(tape.cursor, cursor, 'Repositioned the exhausted cartridge')
+                self.assertEqual(tape.reads, reads, 'Reread the exhausted cartridge')
+                transitions.append(number)
+            return original_request(backup_id, number, action)
+        with patch.object(tb.StreamReader, 'next_volume', next_volume), patch.object(media, 'request', request):
+            destination = self.root / 'restored'
+            tb.restore([full], destination, media, quiet=True)
+        self.assertGreater(len(transitions), 1)
+        self.assertEqual(tree_contents(destination), tree_contents(self.source))
+
     def test_catalog_reads_each_header_once_with_one_eod_seek(self):
         media = TapeMedia()
         full = self.create(media)
@@ -129,6 +157,19 @@ class ReliabilityTests(unittest.TestCase):
         with self.assertRaisesRegex(tb.BackupError, 'shared drive lock'):
             with tb.drive_lock(os.makedev(9, 128)):
                 self.fail('Followed a lock symlink')
+
+    def test_nonregular_shared_lock_is_rejected_without_blocking_on_a_fifo(self):
+        fifo = self.root / 'invalid-lock'
+        os.mkfifo(fifo)
+        result = subprocess.run([sys.executable, '-c',
+            'import sys; from pathlib import Path; import tape_backup as tb\n'
+            'try:\n'
+            '    with tb.shared_lock(Path(sys.argv[1]), "restore lock", "busy"): pass\n'
+            'except tb.BackupError as exc:\n'
+            '    print(exc)\n', str(fifo)],
+            cwd=Path(tb.__file__).resolve().parent, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Invalid shared restore lock', result.stdout)
 
 
 if __name__ == '__main__':

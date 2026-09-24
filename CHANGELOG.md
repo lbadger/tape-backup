@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.0.1 — 2026-09-24
+
+- Share restore destination locks across home directories and accounts, including
+  native ZFS targets. Recheck tar restore history before applying an incremental.
+- Request continuation cartridges directly instead of rewinding and scanning the
+  exhausted tape. Preserve same-cartridge lookup between different backups.
+- Match exclusion inventory with GNU tar's escapes, POSIX character classes,
+  bracket patterns, literal patterns, and source locale. Preserve existing
+  archive selection and exclusion policies.
+- Show wrapped terminal progress with readable sizes, separate source/I/O rates,
+  buffer occupancy, elapsed time, and a `finalizing` ETA during the final commit.
+- Format drive status and backup information as readable terminal details. Add
+  `info` as an alias for `inspect`, with `--text`/`--json` on information commands.
+  Redirected stdout remains JSON; redirected progress retains compact logs.
+- Add regressions for competing processes with different homes, changed restore
+  history, continuation read counts, real GNU tar matching, native ZFS locking,
+  terminal formatting, and standalone-binary exclusions/information output.
+
 ## 2.0.0 — 2026-09-24
 
 - Add native `zfs-backup` and `zfs-restore` for existing filesystem snapshots,

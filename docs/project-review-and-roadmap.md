@@ -55,6 +55,15 @@ preserve those while making operation and recovery easier to understand.
 
 ## Evidence and current strengths
 
+Follow-up review for **v2.0.1** found and fixed three additional issues:
+restore locks depended on `$HOME`, continuation reads could rescan the exhausted
+cartridge, and inventory exclusion matching differed from GNU tar. Regressions
+now cover an independent competing process, history changes before apply,
+physical-simulator reads before a tape prompt, and native GNU pattern behavior.
+The patch also adds readable terminal progress and information views while
+retaining JSON for redirected information output. The baseline findings below
+remain a historical record of the original review.
+
 The source and standalone binary test run completed with **174 passing tests and
 one skipped test** (the optional 10 GiB round trip). Tests include real GNU tar,
 loopback SSH, file-backed media, and a record/filemark cartridge simulator.

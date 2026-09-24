@@ -9,9 +9,9 @@ import ctypes
 from datetime import datetime, timezone
 import errno
 import fcntl
-import fnmatch
 import hashlib
 import json
+import locale
 import os
 from pathlib import Path
 import re
@@ -23,6 +23,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import uuid
@@ -35,7 +36,7 @@ POSITION_INTERVAL = 16 * 1024**2
 MAGIC = b"TAPE-STREAM-3\n"
 ZFS_MAGIC = b"TAPE-STREAM-4\n"
 ZERO_CHAIN = "0" * 64
-PROGRAM_VERSION = "2.0.0"
+PROGRAM_VERSION = "2.0.1"
 # Linux struct mtop: short operation, padding, int count (x86-64 / AArch64).
 MTIOCTOP = 0x40086D01
 MTWEOF = 5
@@ -49,6 +50,7 @@ SSH_MAGIC = b"TAPE-SSH-3\n"
 PACKET_HEADER = struct.Struct("!cQ")
 OUTPUT_LOCK = threading.RLock()
 DRIVE_LOCK_DIRECTORY = Path('/run/lock')
+RESTORE_LOCK_DIRECTORY = Path('/run/lock')
 
 
 class BackupError(Exception):
@@ -182,11 +184,10 @@ def valid_id(value):
 
 
 @contextmanager
-def drive_lock(device_number):
-    # Linux tape minor bits 5/6 select mode; bit 7 selects non-rewind.
-    number = os.minor(device_number) & ~0xe0
-    path = DRIVE_LOCK_DIRECTORY / f'tape-backup-drive-{os.major(device_number)}-{number}.lock'
-    flags = os.O_NOFOLLOW | os.O_CLOEXEC
+def shared_lock(path, label, busy_message, busy_error=BackupError):
+    """Lock the same persistent inode across accounts; never unlink on release."""
+    flags = os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    fd = None
     try:
         try:
             fd = os.open(path, os.O_RDONLY | flags)
@@ -197,18 +198,38 @@ def drive_lock(device_number):
             except FileExistsError:
                 fd = os.open(path, os.O_RDONLY | flags)
     except OSError as exc:
-        raise BackupError(f'Cannot access shared drive lock {path}: {exc}') from exc
+        if fd is not None:
+            os.close(fd)
+        raise BackupError(f'Cannot access shared {label} {path}: {exc}') from exc
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-            raise BackupError(f'Invalid shared drive lock: {path}')
+            raise BackupError(f'Invalid shared {label}: {path}')
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise DriveBusy(f'Another operation is using this tape drive ({path})') from exc
+            raise busy_error(f'{busy_message} ({path})') from exc
         yield
     finally:
         os.close(fd)
+
+
+@contextmanager
+def drive_lock(device_number):
+    # Linux tape minor bits 5/6 select mode; bit 7 selects non-rewind.
+    number = os.minor(device_number) & ~0xe0
+    path = DRIVE_LOCK_DIRECTORY / f'tape-backup-drive-{os.major(device_number)}-{number}.lock'
+    with shared_lock(path, 'drive lock', 'Another operation is using this tape drive', DriveBusy):
+        yield
+
+
+@contextmanager
+def restore_lock(destination, *, zfs=False):
+    identity = ('zfs:' + destination).encode() if zfs else os.fsencode(destination)
+    lock_id = hashlib.sha256(identity).hexdigest()
+    path = RESTORE_LOCK_DIRECTORY / f'tape-backup-restore-{lock_id}.lock'
+    with shared_lock(path, 'restore lock', f'Another operation is restoring to {destination}'):
+        yield
 
 
 def encoded_header(fields):
@@ -237,6 +258,44 @@ def decoded_header(record):
 
 class EndVolume(Exception):
     pass
+
+
+def readable_size(value, max_unit='PiB'):
+    if value is None:
+        return 'Unknown'
+    amount = float(value)
+    for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'):
+        if abs(amount) < 1024 or unit == max_unit:
+            return f'{amount:.0f} B' if unit == 'B' else f'{amount:,.2f} {unit}'
+        amount /= 1024
+
+
+def readable_duration(seconds):
+    seconds = max(0, int(seconds))
+    return f'{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}'
+
+
+def terminal_width(stream):
+    try:
+        width = os.get_terminal_size(stream.fileno()).columns
+    except (OSError, ValueError):
+        width = shutil.get_terminal_size((88, 24)).columns
+    return max(40, min(width, 120))
+
+
+def display_text(value):
+    # Paths and device strings must not inject terminal controls or extra rows.
+    return ''.join(c if c.isprintable() else f'\\x{ord(c):02x}' for c in str(value))
+
+
+def detail_rows(title, rows, width):
+    lines = textwrap.wrap(display_text(title), width=width)
+    padding = max((len(label) for label, value in rows), default=0) + 2
+    for label, value in rows:
+        prefix = '  ' + (label + ':').ljust(padding)
+        lines.extend(textwrap.wrap(display_text('Unknown' if value is None else value), width=width,
+                                   initial_indent=prefix, subsequent_indent=' ' * len(prefix)))
+    return '\n'.join(lines)
 
 
 class Progress:
@@ -283,6 +342,8 @@ class Progress:
         done = written_bytes - self.eta_base
         if self.phase == "complete":
             eta = "00:00:00"
+        elif 'backup completion' in self.phase or self.phase == 'writing metadata file':
+            eta = 'finalizing'
         elif not self.total_bytes or not done:
             eta = "calculating"
         elif done >= self.total_bytes:
@@ -290,6 +351,28 @@ class Progress:
         else:
             seconds = int((self.total_bytes - done) * (now - self.eta_started) / done)
             eta = f"~{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
+        if sys.stderr.isatty():
+            label = f'Backup {self.label[:12]}' if re.fullmatch('[0-9a-f]{32}', self.label) else self.label
+            rows = [f'{label} | {self.phase}',
+                    f'Read {readable_size(read_bytes, "GiB")}  |  Delivered {readable_size(written_bytes, "GiB")}']
+            if self.buffer_size is not None:
+                rows[-1] += f'  |  Committed {readable_size(self.durable_bytes, "GiB")}'
+                rows.append(f'Buffer {readable_size(self.buffer_size)} each  |  '
+                            f'Queued {readable_size(self.queued_bytes)}  |  Recovery {readable_size(self.retry_bytes)}')
+            if self.reader_state is not None:
+                rows.append(f'Source {read_rate:.1f} MiB/s ({self.reader_state})')
+            rows.append(f'I/O {rate:.1f} MiB/s  |  Average {average:.1f} MiB/s  |  '
+                        f'Elapsed {readable_duration(now - self.started)}')
+            rows.append(f'ETA {eta} (current archive)')
+            width = terminal_width(sys.stderr)
+            lines = []
+            for index, row in enumerate(rows):
+                lines.extend(textwrap.wrap(display_text(row), width=width,
+                    initial_indent='' if index == 0 else '  ', subsequent_indent='  '))
+            log('\n'.join(lines))
+            self.last_time, self.last_bytes = now, transferred
+            self.last_read_bytes = read_bytes
+            return
         buffer = f"buffer {self.buffer_size / 1024**2:g} MiB; " if self.buffer_size is not None else ""
         if self.buffer_size is not None:
             buffer += (f"queued {self.queued_bytes / 1024**2:.1f} MiB, "
@@ -454,6 +537,88 @@ def device_status(media):
     if result['state'] and result['state']['write_protected']:
         result['recommendations'].append('Tape is write-protected; reads remain available')
     return result
+
+
+def format_device_status(result):
+    width = terminal_width(sys.stdout)
+    state = result.get('state')
+    if state is None:
+        state_text = 'Unknown (drive in use)' if result['busy'] else 'Unknown'
+    else:
+        descriptions = [('beginning_of_tape', 'beginning of tape'), ('end_of_data', 'end of data'),
+                        ('end_of_tape', 'end of tape'), ('door_open', 'no cartridge'),
+                        ('write_protected', 'write protected')]
+        state_text = ', '.join(['Online' if state['online'] else 'Offline',
+                               *(text for flag, text in descriptions if state.get(flag))])
+    compression = result.get('compression')
+    compression_text = ('Unknown' if compression is None else 'Unsupported' if not compression['supported']
+                        else 'On' if compression['enabled'] else 'Off')
+    number = lambda value: 'Unknown' if value is None or value < 0 else str(value)
+    position = result.get('position')
+    statistics = result.get('statistics', {})
+    rows = [('Model', ' '.join(filter(None, (result.get('vendor'), result.get('model')))) or None),
+            ('Firmware', result.get('rev')), ('State', state_text),
+            ('Drive access', 'In use; passive statistics only' if result['busy'] else 'Not locked by tape-backup'),
+            ('Compression', compression_text),
+            ('Tape file / block', f'{number(result.get("file_number"))} / {number(result.get("block_number"))}'),
+            ('Logical position', f'Host {position[0]} / media {position[1]}' if position is not None else None),
+            ('Read since boot', readable_size(statistics.get('read_byte_cnt'))),
+            ('Written since boot', readable_size(statistics.get('write_byte_cnt'))),
+            ('I/O in flight', statistics.get('in_flight'))]
+    if result.get('driver_options') is not None:
+        rows.append(('Driver options', f'0x{result["driver_options"]:x}'))
+    rows += [('Warning', warning) for warning in result.get('warnings', [])]
+    rows += [('Note', advice) for advice in result.get('recommendations', [])]
+    return detail_rows(f'Tape drive: {result["device"]}', rows, width)
+
+
+def format_backup_info(result):
+    width = terminal_width(sys.stdout)
+    def describe(job, title):
+        source = job.get('source')
+        if job.get('ssh'):
+            source = f'{job["ssh"]["host"]}:{source}'
+        created = job.get('created')
+        if created:
+            try:
+                created = datetime.fromisoformat(created).isoformat(sep=' ', timespec='seconds')
+            except ValueError:
+                pass
+        rows = [('ID', job['id']),
+                ('Backup type', f'{job["level"]} / {job.get("archive_type", "tar")}'),
+                ('Source', source), ('Created', created)]
+        if job.get('parent'):
+            rows.append(('Parent', job['parent']))
+        for key, label in (('volume', 'Volume on cartridge'), ('volumes', 'Total volumes'),
+                           ('cartridge', 'Cartridge')):
+            if key in job:
+                rows.append((label, job[key]))
+        if 'data_bytes' in job:
+            rows.append(('Archive size', readable_size(job['data_bytes'])))
+        elif job.get('estimated_bytes') is not None:
+            rows.append(('Estimated archive', readable_size(job['estimated_bytes'])))
+        if job.get('zfs'):
+            rows += [('ZFS snapshot', job['zfs']['snapshot']),
+                     ('Raw send', 'Yes' if job['zfs']['raw'] else 'No')]
+        if job.get('excludes'):
+            rows.append(('Exclusions', ', '.join(job['excludes'])))
+        rows.append(('Data checksums', 'Verified' if job.get('data_verified') else 'Not verified; run verify'))
+        return detail_rows(title, rows, width)
+    if 'backups' not in result:
+        return describe(result, 'Verified backup' if result.get('data_verified') else 'Backup metadata')
+    complete = 'complete' if result['scan_complete'] else 'incomplete'
+    parts = [f'Cartridge backups: {len(result["backups"])}  |  Listing {complete}']
+    parts.extend(describe(job, f'Backup {index}') for index, job in enumerate(result['backups'], 1))
+    for error in result.get('errors', []):
+        parts.append(detail_rows('Inspection incomplete',
+            [('Cartridge', error.get('cartridge')), ('Reason', error['error'])], width))
+    return '\n\n'.join(parts)
+
+
+def information_output(result, formatter, output_format=None):
+    if output_format == 'json' or (output_format is None and not sys.stdout.isatty()):
+        return json.dumps(result, indent=2)
+    return formatter(result)
 
 
 class Volume:
@@ -1393,8 +1558,15 @@ class StreamReader:
             volume.close()
 
     def next_volume(self):
+        physical = self.volume is not None and self.volume.physical
         self.close()
         requested_number = self.number + 1
+        if self.number and physical:
+            # Every continuation starts on a different cartridge. Looking for
+            # it on the exhausted tape would rewind and scan that tape again.
+            self.media.loaded = False
+        if self.progress:
+            self.progress.phase = f'waiting for volume {requested_number}'
         while True:
             try:
                 self.media.load(self.backup_id, requested_number, False)
@@ -2093,8 +2265,7 @@ def restore_zfs(backup_ids, dataset, media):
         raise BackupError('OpenZFS zfs command is required on the restore machine')
     for backup_id in backup_ids:
         valid_id(backup_id)
-    lock_id = hashlib.sha256(('zfs:' + dataset).encode()).hexdigest()
-    with locked(Path.home() / '.cache/tape-backup/restores' / lock_id), media.lock():
+    with restore_lock(dataset, zfs=True), media.lock():
         exists = zfs_target_exists(dataset)
         previous_id = None
         if exists:
@@ -2177,8 +2348,62 @@ def restore_zfs(backup_ids, dataset, media):
     return dataset
 
 
+@contextmanager
+def exclusion_matcher(patterns):
+    """Use GNU/Linux fnmatch with tar's anchored, slash-matching semantics.
+
+    A thread-local locale follows the same environment as the tar subprocess,
+    including character classes and collation, without changing other threads.
+    """
+    if not patterns:
+        yield lambda relative: False
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.fnmatch.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+    libc.fnmatch.restype = ctypes.c_int
+    libc.newlocale.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p]
+    libc.newlocale.restype = ctypes.c_void_p
+    libc.uselocale.argtypes = [ctypes.c_void_p]
+    libc.uselocale.restype = ctypes.c_void_p
+    libc.freelocale.argtypes = [ctypes.c_void_p]
+    libc.freelocale.restype = None
+    handle = libc.newlocale((1 << locale.LC_CTYPE) | (1 << locale.LC_COLLATE), b'', None)
+    if not handle:
+        raise BackupError('Cannot initialize exclusion matching locale; check LANG and LC_* settings')
+    previous = libc.uselocale(handle)
+    try:
+        encoded, literals = [], []
+        for pattern in patterns:
+            # GNU tar treats patterns without unescaped wildcards as literals,
+            # unescaping them but preserving a final lone backslash. fnmatch
+            # alone treats that final backslash differently.
+            index = 0
+            while index < len(pattern):
+                if pattern[index] == '\\' and index + 1 < len(pattern):
+                    index += 2
+                elif pattern[index] in '*?[':
+                    break
+                else:
+                    index += 1
+            value = os.fsencode('./' + pattern)
+            if index == len(pattern):
+                literals.append(re.sub(rb'\\(.)', rb'\1', value, flags=re.DOTALL))
+            else:
+                encoded.append(value)
+        def matches(relative):
+            name = os.fsencode('./' + relative)
+            # FNM_LEADING_DIR: excluding a directory also excludes descendants.
+            return (any(name == value or name.startswith(value + b'/') for value in literals) or
+                    any(libc.fnmatch(pattern, name, 8) == 0 for pattern in encoded))
+        yield matches
+    finally:
+        libc.uselocale(previous)
+        libc.freelocale(handle)
+
+
 def is_excluded(relative, patterns):
-    return any(fnmatch.fnmatchcase(relative, pattern) for pattern in patterns)
+    with exclusion_matcher(patterns) as matches:
+        return matches(relative)
 
 
 def estimate_source(source, parent_created=None, excludes=None):
@@ -2187,14 +2412,14 @@ def estimate_source(source, parent_created=None, excludes=None):
     total, entries, hardlinks = 10240, 0, set()
     def scan_error(exc):
         raise exc
-    with Progress("Source inventory", transfer=False) as progress:
+    with exclusion_matcher(excludes) as excluded, Progress("Source inventory", transfer=False) as progress:
         for directory, subdirs, files in os.walk(source, followlinks=False,
                                                 onerror=scan_error):
             relative = Path(directory).relative_to(source)
             subdirs[:] = [name for name in subdirs
-                          if not is_excluded((relative / name).as_posix(), excludes or [])]
+                          if not excluded((relative / name).as_posix())]
             files = [name for name in files
-                     if not is_excluded((relative / name).as_posix(), excludes or [])]
+                     if not excluded((relative / name).as_posix())]
             total += 2048 + sum(len(os.fsencode(name)) + 2 for name in subdirs + files)
             for name in files + subdirs:
                 info = (Path(directory) / name).lstat()
@@ -2683,12 +2908,11 @@ def restore(backup_ids, destination, media, *, quiet=False, base=None):
                                         inside(destination, media.directory)):
         raise BackupError("Restore destination and media must be separate")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    lock_id = hashlib.sha256(os.fsencode(destination)).hexdigest()
-    lock_path = Path.home() / '.cache' / 'tape-backup' / 'restores' / lock_id
     tree = None
     try:
-        with locked(lock_path), media.lock(), Progress("Restore") as progress:
+        with restore_lock(destination), media.lock(), Progress("Restore") as progress:
             parent = read_restore_marker(destination)
+            expected_history = parent
             if parent is not None and base and parent['id'] != base:
                 raise BackupError('--base differs from the last completed restore recorded for this directory')
             if parent is None and base:
@@ -2741,6 +2965,8 @@ def restore(backup_ids, destination, media, *, quiet=False, base=None):
                             raise BackupError('Incremental header changed after verification; refusing to apply')
                         if directory_identity(destination) != identity:
                             raise BackupError('Restore destination changed during verification')
+                        if read_restore_marker(destination) != expected_history:
+                            raise BackupError('Restore history changed during verification; refusing to apply')
                         # Persist uncertainty before tar can alter or delete any
                         # file; a crash must never permit the next incremental.
                         write_restore_marker(destination, parent, pending=backup_id)
@@ -2756,6 +2982,7 @@ def restore(backup_ids, destination, media, *, quiet=False, base=None):
                         progress.phase = 'flushing updated files'
                         os.sync()
                         write_restore_marker(destination, job)
+                        expected_history = restore_job(job)
                     parent = job
                 except BaseException:
                     if inplace:
@@ -2816,7 +3043,7 @@ Start full backups on blank tapes; incrementals always append.
 Run tape-backup COMMAND --help for options and tape-selection details.
 Default device: /dev/nst0. Tapes stay loaded until you run eject.''')
     parser.add_argument("--version", action="version", version=f"%(prog)s {PROGRAM_VERSION}")
-    commands = parser.add_subparsers(dest="command", required=True, title='Commands', metavar='COMMAND')
+    commands = parser.add_subparsers(dest="command", required=True, title='Commands', metavar='COMMAND', prog=parser.prog)
 
     def media_options(command):
         group = command.add_mutually_exclusive_group()
@@ -2830,6 +3057,13 @@ Default device: /dev/nst0. Tapes stay loaded until you run eject.''')
         command.add_argument('--ssh-identity', type=Path)
         command.add_argument('--ssh-config', type=Path)
         command.add_argument('--remote-program', help='Remote tape-backup executable path')
+
+    def information_options(command):
+        group = command.add_mutually_exclusive_group()
+        group.add_argument('--json', dest='output_format', action='store_const', const='json',
+                           help='Print JSON (the default when stdout is redirected)')
+        group.add_argument('--text', dest='output_format', action='store_const', const='text',
+                           help='Print readable details (the default in a terminal)')
 
     create = commands.add_parser("backup", help="Stream source files directly to tape")
     create.add_argument("--source", required=True, type=Path)
@@ -2879,7 +3113,9 @@ Default device: /dev/nst0. Tapes stay loaded until you run eject.''')
     listing.add_argument('--backup', help='Backup ID; omit to discover the first backup on the loaded tape')
     media_options(listing)
     for name in ("inspect", "verify"):
-        command = commands.add_parser(name, help="List backups on the loaded cartridge" if name == "inspect" else "Verify all tape data")
+        command = commands.add_parser(name, aliases=['info'] if name == 'inspect' else [],
+            help="List backups on the loaded cartridge (alias: info)" if name == "inspect" else "Verify all tape data")
+        information_options(command)
         if name == 'inspect':
             selection = command.add_mutually_exclusive_group()
             selection.add_argument('--backup', help='Read only the selected backup header')
@@ -2903,6 +3139,7 @@ Default device: /dev/nst0. Tapes stay loaded until you run eject.''')
     for name in ('status', 'doctor'):
         status = commands.add_parser(name, help='Show drive state and diagnostics without moving or changing the tape')
         status.add_argument('--device', default='/dev/nst0', help='Tape device (default: /dev/nst0)')
+        information_options(status)
     return parser
 
 
@@ -2921,9 +3158,11 @@ def main(argv=None):
         if argv[0] == 'help':
             argv = [*argv[1:], '--help']
         args = parser.parse_args(argv)
+        if args.command == 'info':
+            args.command = 'inspect'
         if args.command in ('status', 'doctor'):
             result = device_status(TapeMedia(args.device))
-            print(json.dumps(result, indent=2))
+            print(information_output(result, format_device_status, args.output_format))
             return 0 if result['busy'] or result['state'] is not None else 1
         if args.command == "eject":
             media = TapeMedia(args.device)
@@ -2982,14 +3221,14 @@ def main(argv=None):
                             media, allow_scan=args.scan or isinstance(media, FileMedia), progress=progress)
                         progress.phase = 'complete' if result.get('scan_complete', True) else 'incomplete'
                     if not result.get('scan_complete', True):
-                        print(json.dumps(result, indent=2))
+                        print(information_output(result, format_backup_info, args.output_format))
                         return 1
                 elif args.command == 'list':
                     list_files(media, args.backup)
                     return 0
                 else:
                     result = scan(media, args.backup)
-            result = json.dumps(result, indent=2)
+            result = information_output(result, format_backup_info, args.output_format)
         if args.command in ('backup', 'zfs-backup'):
             if args.verify:
                 try:

@@ -19,18 +19,20 @@ to select another non-rewinding tape drive.
 
 ## Current executable
 
-Version **2.0.0** adds native ZFS streaming, file/folder exclusions, safer tape
-handling, clearer help, and drive diagnostics. Existing format-3 tar backups
+Version **2.0.1** includes native ZFS streaming, file/folder exclusions, safer tape
+handling, clearer help, and drive diagnostics. It fixes shared restore locking,
+unnecessary continuation scans, and exclusion matching, and improves terminal
+progress and information displays. Existing format-3 tar backups
 remain readable. Update both machines when using SSH; transport version 3 prevents
 older helpers from silently ignoring exclusion or ZFS options.
 
 Download the executable and checksum from the
-[v2.0.0 release](https://github.com/lbadger/tape-backup/releases/tag/v2.0.0), or
+[v2.0.1 release](https://github.com/lbadger/tape-backup/releases/tag/v2.0.1), or
 build from the current source checkout using Docker:
 
 ```bash
 ./build.sh
-./dist/tape-backup --version  # tape-backup 2.0.0
+./dist/tape-backup --version  # tape-backup 2.0.1
 (cd dist && sha256sum --check tape-backup.sha256)
 ```
 
@@ -53,6 +55,10 @@ position queries and seeks use logical block addresses. Run it with exclusive ac
 Shared locks under `/run/lock/tape-backup-drive-*.lock` prevent competing v2 jobs
 across accounts and tape-mode aliases. They cannot exclude unrelated tape programs.
 The lock directory must be available and writable for initial lock creation.
+Restore destinations also use shared `/run/lock/tape-backup-restore-*.lock`
+files. Commands with different `$HOME` values or different tape drives cannot
+restore to the same destination path concurrently. These persistent lock files
+are released by closing the descriptor; do not delete them while jobs run.
 
 Run `./tape-backup` for the command menu and examples, or
 `./tape-backup help backup` for a command's options. File backups use `backup` and
@@ -178,6 +184,12 @@ while `nested/cache` selects that specific nested directory. `*`, `?`, and brack
 patterns are supported; wildcards can match `/`, so `*.tmp` also excludes nested
 temporary files. Quote patterns to prevent expansion by your shell. Use
 source-relative paths, not `/opt/...` or `../...`.
+
+Inventory follows GNU tar's matching rules, including POSIX character classes
+such as `[[:digit:]]`, bracket negation, and backslash escapes. `cache\*` matches
+a literal `cache*`; use `cache\\*` to match names beginning with a literal
+backslash after `cache`. A bracket expression such as `[*]` also matches a literal
+asterisk. Character classes follow the source host's locale in both stages.
 
 Exclusion files contain one pattern per line. Empty lines are ignored; spaces and
 `#` are literal, and lines are not shell commands or comments. These files are
@@ -477,12 +489,23 @@ successful backups still print only their ID on stdout. `--verify` performs a
 full read-back after backup; only successful verification sets `data_verified`
 true. Verification failures return nonzero and identify the committed backup.
 
-File names are printed by default. A status line is printed every five seconds
-and at completion, for example:
+File names are printed by default. Progress is printed every five seconds and
+at completion. Terminals show a block sized to the available width, for example:
 
 ```text
-BACKUP_ID: writing volume 1, chunk 1792; 8192.0 MiB read, 7168.0 MiB delivered; buffer 1024 MiB; queued 1020.0 MiB, recovery 130.0 MiB, committed 7040.0 MiB; reader reading, 180.0 MiB/s source; 155.0 MiB/s I/O, 149.3 MiB/s average; ETA ~02:14:08 (current archive); 55s elapsed
+Backup 726246ca4cb4 | writing volume 1, chunk 382644
+  Read 1,495.66 GiB  |  Delivered 1,494.70 GiB  |  Committed 1,494.25 GiB
+  Buffer 1.00 GiB each  |  Queued 989.10 MiB  |  Recovery 479.40 MiB
+  Source 176.0 MiB/s (reading)
+  I/O 188.5 MiB/s  |  Average 162.4 MiB/s  |  Elapsed 02:39:30
+  ETA ~00:00:06 (current archive)
 ```
+
+The progress heading abbreviates the ID; the startup message and successful
+backup result retain the full ID. Transfer counters use at most GiB so ordinary
+progress remains visible on multi-terabyte archives. Redirected stderr retains
+the compact log format. During the final tape commit and metadata write, ETA
+shows `finalizing` until the command actually completes.
 
 Backup status shows the configured buffer budget, queued payload bytes, recovery
 bytes retained (including framing), and archive bytes confirmed on media. Each of
@@ -637,11 +660,21 @@ separate list of deletions. Use `inspect` to find backup IDs on a shared cartrid
 # Inspect a particular backup's first volume, possibly later on the same tape.
 ./tape-backup inspect --backup BACKUP_ID --device /dev/nst0
 
+# info is an alias for inspect. Force a format when needed.
+./tape-backup info --first --text
+./tape-backup inspect --json > cartridge.json
+
 # Read and verify every data chunk and the whole archive's checksum.
 ./tape-backup verify --backup BACKUP_ID --device /dev/nst0
 ```
 
-Plain `inspect` lists the full backup and appended incrementals in its `backups`
+In a terminal, `inspect` (also `info`) and `verify` show labeled, wrapped details
+with complete IDs and an explicit data-verification state. `--json` selects
+structured output; redirected stdout defaults to JSON to preserve scripts.
+`--text` forces readable output even through a pipe. Partial listings still
+return exit code 1 and show the entries found plus the failure reason.
+
+The JSON output from plain `inspect` lists the full backup and appended incrementals in its `backups`
 array. `--all` remains an optional alias for this default. Each entry includes its
 ID, source, creation time, full/incremental level, parent ID, and volume number.
 It lists segments on the loaded cartridge, including continuation segments;
@@ -771,10 +804,16 @@ already exited backup.
 ```bash
 ./tape-backup status
 ./tape-backup doctor --device /dev/nst0
+./tape-backup status --json
+./tape-backup status --text | less
 ```
 
-Both commands print JSON with available identity, readiness, write-protection,
-compression, logical position, driver settings, and passive I/O counters. They
+Both commands show aligned details in a terminal, including identity, readiness,
+write-protection, compression, tape file/block, logical position, driver settings,
+and I/O counters with readable units. Missing information says `Unknown`, rather
+than implying compression is off or the tape is at block zero. `--json` selects
+structured output; redirected stdout defaults to JSON. `--text` forces readable
+output in a pipe. They
 do not rewind, erase, eject, or change settings. Unsupported/unavailable fields
 remain unknown with diagnostics. When another v2 command owns the shared drive
 lock, only passive sysfs statistics are read. Counters describe host I/O, not

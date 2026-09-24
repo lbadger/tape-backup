@@ -106,6 +106,15 @@ class ZFSStreamTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(tb.BackupError):
                 tb.zfs_name(name, snapshot=True)
 
+    def test_zfs_restore_uses_a_shared_destination_lock_across_homes(self):
+        target = 'tank/recovered'
+        with tb.restore_lock(target, zfs=True), \
+                patch.object(Path, 'home', return_value=self.root / 'other-home'), \
+                patch.object(tb.shutil, 'which', return_value='/zfs'), \
+                patch.object(tb, 'zfs_target_exists', side_effect=AssertionError('Touched locked destination')):
+            with self.assertRaisesRegex(tb.BackupError, 'Another operation is restoring'):
+                tb.restore_zfs(['a' * 32], target, self.media)
+
 
 class ZFSSSHTests(unittest.TestCase):
     def test_real_ssh_transport_streams_native_full_and_incremental_sources(self):

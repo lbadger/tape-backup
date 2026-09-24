@@ -57,7 +57,7 @@ class BinaryTests(unittest.TestCase):
         self.assertEqual(actual, expected)
 
     def test_relocated_binary_without_python_full_and_incremental_restore(self):
-        self.assertEqual(self.run_binary("--version"), "tape-backup 2.0.0")
+        self.assertEqual(self.run_binary("--version"), "tape-backup 2.0.1")
         self.assertIn("/dev/nst0", self.run_binary("backup", "--help"))
         self.assertNotIn('--volume-size', self.run_binary('backup', '--help'))
         full = self.run_binary(*self.backup_args)
@@ -245,6 +245,22 @@ class BinaryTests(unittest.TestCase):
         self.restore([full])
         self.run_binary(*args, "--buffer-size", str(10 * 1024**3 + 1), expected=1)
         self.assertIn("64KiB and 10GiB", self.last_stderr)
+
+    def test_binary_exclusion_matching_and_readable_info(self):
+        excluded = self.source / '1cache'
+        excluded.mkdir()
+        (excluded / 'secret').write_text('excluded')
+        excluded.chmod(0)
+        self.addCleanup(excluded.chmod, 0o700)
+        full = self.run_binary(*self.backup_args, '--exclude', '[[:digit:]]*')
+        listing = self.run_binary('list', '--backup', full, '--media-dir', self.media)
+        self.assertNotIn('1cache', listing)
+        text = self.run_binary('info', '--backup', full, '--media-dir', self.media, '--text')
+        self.assertIn(full, text)
+        self.assertIn('Backup metadata', text)
+        self.assertIn('Not verified; run verify', text)
+        result = json.loads(self.run_binary('info', '--backup', full, '--media-dir', self.media, '--json'))
+        self.assertFalse(result['data_verified'])
 
     @unittest.skipUnless(os.environ.get("TAPE_BACKUP_LARGE_TEST"),
                          "Set TAPE_BACKUP_LARGE_TEST=1 for a 10 GiB streaming round trip")

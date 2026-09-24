@@ -1,12 +1,13 @@
 """Separate incremental restores, baseline identity, and interrupted apply."""
 from contextlib import redirect_stderr
 import errno
-import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -202,10 +203,37 @@ class RestoreStepsTests(unittest.TestCase):
 
     def test_same_destination_is_locked_even_when_using_different_media(self):
         self.restore([self.full])
-        lock_id = hashlib.sha256(os.fsencode(self.destination)).hexdigest()
-        lock_path = Path.home() / '.cache' / 'tape-backup' / 'restores' / lock_id
-        with tb.locked(lock_path), self.assertRaisesRegex(tb.BackupError, 'Another operation'):
+        with tb.restore_lock(self.destination), self.assertRaisesRegex(tb.BackupError, 'Another operation'):
             tb.restore([self.first], self.destination, tb.FileMedia(self.root / 'other-tapes'), quiet=True)
+        self.assertEqual(tree_contents(self.destination), self.full_tree)
+
+    def test_competing_process_with_another_home_cannot_change_files_or_history(self):
+        self.restore([self.full])
+        other_media = self.root / 'other-tapes'
+        shutil.copytree(self.media.directory, other_media)
+        before = tb.restore_marker_path(self.destination).read_bytes()
+        # Independent process, HOME, and media: only the destination lock is shared.
+        with tb.restore_lock(self.destination):
+            result = subprocess.run([sys.executable, str(Path(tb.__file__).resolve()),
+                'restore', '--backup', self.first, '--destination', str(self.destination),
+                '--media-dir', str(other_media), '--quiet'], capture_output=True, text=True,
+                env={**os.environ, 'HOME': str(self.root / 'other-home')}, timeout=10)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('Another operation is restoring', result.stderr)
+        self.assertEqual(tree_contents(self.destination), self.full_tree)
+        self.assertEqual(tb.restore_marker_path(self.destination).read_bytes(), before)
+        self.restore([self.first])  # The lock releases normally.
+
+    def test_changed_history_during_verification_is_rejected_before_applying(self):
+        self.restore([self.full])
+        frames = tb.StreamReader.frames
+        def change_history(reader, **kwargs):
+            yield from frames(reader, **kwargs)
+            tb.write_restore_marker(self.destination, reader.job)
+        with patch.object(tb.StreamReader, 'frames', change_history), \
+                patch.object(tb, 'extract_restore_stream', side_effect=AssertionError('Applied stale baseline')):
+            with self.assertRaisesRegex(tb.BackupError, 'history changed'):
+                self.restore([self.first])
         self.assertEqual(tree_contents(self.destination), self.full_tree)
 
     def test_changed_destination_during_verification_is_not_adopted_or_modified(self):
