@@ -20,21 +20,22 @@ to select another non-rewinding tape drive.
 
 ## Current executable
 
-Version **2.1.1** protects ancestor tapes during prompted wipes, adds `eject` at
-cartridge-change prompts, avoids archive scans for catalog-confirmed missing
-backups, and fixes verification progress. It includes native ZFS streaming,
+Version **2.2.0** adds persistent cartridge labels, an optional rebuildable
+inventory, restore-chain planning/discovery, and non-writing backup previews.
+It includes ancestor protection during prompted wipes, prompt ejection, accurate
+verification progress, native ZFS streaming,
 file/folder exclusions, shared restore locking, and readable drive diagnostics.
 Existing format-3 tar backups
 remain readable. Update both machines when using SSH; transport version 3 prevents
 older helpers from silently ignoring exclusion or ZFS options.
 
 Download the executable and checksum from the
-[v2.1.1 release](https://github.com/lbadger/tape-backup/releases/tag/v2.1.1), or
+[v2.2.0 release](https://github.com/lbadger/tape-backup/releases/tag/v2.2.0), or
 build from the current source checkout using Docker:
 
 ```bash
 ./build.sh
-./dist/tape-backup --version  # tape-backup 2.1.1
+./dist/tape-backup --version  # tape-backup 2.2.0
 (cd dist && sha256sum --check tape-backup.sha256)
 ```
 
@@ -760,6 +761,130 @@ Use the current executable or source for selecting appended backups; the older
 v1.0.0 reader does not implement cartridge catalog lookup.
 
 See the [append design and validation notes](docs/append-incrementals.md).
+
+## Preview a backup without writing tape
+
+```bash
+./tape-backup backup --source /opt --dry-run --exclude cache \
+  --cartridge-capacity 2500GiB
+./tape-backup backup --source /opt --level incremental --base PREVIOUS_ID \
+  --dry-run --json
+./tape-backup zfs-backup --snapshot tank/books@next --base PREVIOUS_ID --dry-run
+```
+
+Previews validate the source and options, inherit the parent's exclusion policy,
+and estimate archive size without starting tar creation or a ZFS send stream.
+Local and SSH sources are supported. A full preview needs no tape drive; an
+incremental preview reads the parent's first header from tape under the drive
+lock. Native ZFS uses `zfs send` in estimate-only mode and validates snapshot GUIDs.
+
+The preview does **not** check blank media, remaining physical capacity, or the
+final append position. It is not an exact changed-file list. Actual backups repeat
+source and tape validation. `--cartridge-capacity` is a preview-only estimate input,
+not a write limit; the hidden `--volume-size` remains the testing write limit.
+The cartridge estimate assumes empty cartridges and no hardware compression.
+Framing, recovery, metadata, and existing contents change the actual count.
+
+## Cartridge labels and optional inventory
+
+```bash
+./tape-backup backup --source /opt --label-prefix BOOKS-202609 \
+  --inventory /root/tapes.json
+./tape-backup backup --source /opt --level incremental --base PREVIOUS_ID \
+  --inventory /root/tapes.json
+```
+
+New cartridges receive a random recording ID and a readable label in their volume
+headers. The example labels new cartridges `BOOKS-202609-001`, `BOOKS-202609-002`,
+and so on. Without a prefix, labels use `TAPE-` plus part of the random ID.
+The prefix counter restarts for each command; use a distinct prefix for a new set.
+The recording ID distinguishes tapes even if readable labels are duplicated.
+These are ordinary tape records, not MAM or hardware serial numbers. Wiping and
+reusing a cartridge starts a new recording identity. Labels are not changed in place.
+
+Appending preserves the cartridge's existing identity and label, even when a
+different prefix was supplied. New continuation cartridges receive new identities.
+Older tapes remain readable and appendable; their unlabeled identity is derived
+from the first recorded header. Physically label cartridges using the printed
+label, and retain the full ID and volume numbers when needed for recovery.
+
+`--inventory FILE` on backup creates or atomically updates an optional JSON file
+after the archive is committed. It records all volumes written by the command,
+including earlier cartridges without final catalogs. It also survives a later
+verification failure. An inventory write failure produces a warning and
+`inventory_updated: false` in the backup JSON; the completed tape archive remains
+usable. No inventory is written by a preview.
+
+Rebuild or extend an inventory from existing tapes:
+
+```bash
+# Repeat with each cartridge inserted. No archive scan is performed by default.
+./tape-backup inventory --output /root/tapes.json
+
+# Explicit fallback when metadata is insufficient; this can take hours.
+./tape-backup inventory --output /root/tapes.json --scan
+```
+
+Without a usable final catalog, the default command collects only the first
+header and returns **2** to indicate incomplete cartridge coverage. An earlier
+cartridge can hold additional segments that require `--scan` to discover.
+Successful observations are retained even if another part of the cartridge
+cannot be read. Simulated `--media-dir` inventories cover all files in that directory.
+
+The inventory is limited to 64 MiB and 100,000 segment observations. It is a cache
+of observations, not proof that tapes are still available or verified. Rescanning
+merges observations; it does not automatically delete records for erased or lost
+tapes. Start a new inventory file when rebuilding from only the tapes you retain.
+Conflicting backup identities are refused. Reads can use `--inventory FILE` to
+show label hints at cartridge prompts, but still validate actual tape contents.
+The loader's four arguments are unchanged.
+
+Deleting this file does not affect explicit-ID backup, verify, or restore. Tape
+metadata remains the recovery source of truth; the inventory never authorizes
+overwriting or appending.
+
+## Plan and discover a restore chain
+
+```bash
+# Offline planning from an inventory; no destination or tape drive is needed.
+./tape-backup restore --to LATEST_BACKUP_ID --plan --inventory /root/tapes.json
+
+# Apply the discovered full chain into a new destination.
+./tape-backup restore --to LATEST_BACKUP_ID --inventory /root/tapes.json \
+  --destination /srv/recovered
+
+# Native ZFS supports the same planning/discovery options.
+./tape-backup zfs-restore --to LATEST_BACKUP_ID --plan --inventory /root/tapes.json
+./tape-backup zfs-restore --to LATEST_BACKUP_ID --inventory /root/tapes.json \
+  --dataset tank/recovered
+```
+
+Without `--inventory`, planning reads catalog/header information from the loaded
+cartridge (all cartridge files for `--media-dir`), without a payload scan. It
+shows the full-to-incremental order, cartridge labels and recording IDs, missing
+backup observations, missing volumes, and unknown final volume counts. Complete
+ancestor metadata can identify missing intermediate backups; older headers are
+followed through their parent IDs as far as the available observations permit.
+
+`--plan` accepts `--text` or `--json` and returns **0** for a complete metadata plan,
+**2** for missing information, and **1** for invalid/conflicting information.
+It does not verify archive data or establish that every listed cartridge is
+physically available. `--to` without `--plan` refuses an incomplete plan and uses
+the existing restore validation to check every actual stream before claiming
+success. A stale or edited inventory cannot bypass tape identity/chain checks.
+`--to` selects a full chain for a new destination; explicit `--backup ID...`
+remains available for stepwise restores and recovery without an inventory.
+
+```mermaid
+flowchart LR
+    A[Completed backups or tape metadata] --> B[Optional inventory]
+    B --> C[Choose recovery point]
+    C --> D[Check parent chain and volume observations]
+    D -->|Missing information| E[Collect additional cartridge metadata]
+    E --> B
+    D -->|Plan complete| F[Load tapes and validate actual streams]
+    F --> G[Restore full then incrementals]
+```
 
 ## Automated tape loading
 

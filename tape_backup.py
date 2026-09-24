@@ -36,7 +36,7 @@ POSITION_INTERVAL = 16 * 1024**2
 MAGIC = b"TAPE-STREAM-3\n"
 ZFS_MAGIC = b"TAPE-STREAM-4\n"
 ZERO_CHAIN = "0" * 64
-PROGRAM_VERSION = "2.1.1"
+PROGRAM_VERSION = "2.2.0"
 # Linux struct mtop: short operation, padding, int count (x86-64 / AArch64).
 MTIOCTOP = 0x40086D01
 MTWEOF = 5
@@ -211,6 +211,34 @@ def child_ancestry(parent):
     ancestors = [valid_id(parent['id']), *ancestors]
     return {'ancestors': ancestors[:MAX_ANCESTORS],
             'ancestry_complete': complete and len(ancestors) <= MAX_ANCESTORS}
+
+
+def valid_label(value):
+    if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,47}', value):
+        raise BackupError('Cartridge labels must be 1–48 letters, digits, dots, underscores, or hyphens')
+    return value
+
+
+def cartridge_identity(head, fallback=None):
+    """Optional volume-header metadata; legacy identities derive from the first header."""
+    value = head.get('cartridge_identity')
+    if value is None:
+        return {'id': fallback, 'label': None}
+    if not isinstance(value, dict):
+        raise BackupError('Invalid cartridge identity')
+    valid_id(value.get('id'))
+    if value.get('label') is not None:
+        valid_label(value['label'])
+    return {'id': value['id'], 'label': value.get('label')}
+
+
+def new_cartridge(media):
+    identifier = uuid.uuid4().hex
+    prefix = getattr(media, 'label_prefix', None)
+    number = getattr(media, 'label_number', 0) + 1
+    media.label_number = number
+    label = f'{prefix}-{number:03d}' if prefix else f'TAPE-{identifier[:12]}'
+    return {'id': identifier, 'label': valid_label(label)}
 
 
 @contextmanager
@@ -679,7 +707,8 @@ def format_backup_info(result):
         if job.get('parent'):
             rows.append(('Parent', job['parent']))
         for key, label in (('volume', 'Volume on cartridge'), ('volumes', 'Total volumes'),
-                           ('cartridge', 'Cartridge')):
+                           ('cartridge', 'Cartridge'), ('cartridge_label', 'Tape label'),
+                           ('cartridge_id', 'Cartridge ID')):
             if key in job:
                 rows.append((label, job[key]))
         if 'data_bytes' in job:
@@ -1253,6 +1282,13 @@ class TapeMedia:
                 warning = ' (existing backups will be retained)'
             elif number == 0:
                 label = 'the cartridge to inspect'
+            hints = [entry.get('cartridge_label') for entry in getattr(self, 'inventory_entries', [])
+                     if entry['id'] == backup_id and
+                     (entry['volume'] == number or action == 'append') and entry.get('cartridge_label')]
+            if hints:
+                label += ' (inventory labels: ' + ', '.join(sorted(set(hints))) + ')'
+            if action == 'blank' and getattr(self, 'pending_cartridge', None):
+                label += ' [new label ' + self.pending_cartridge['label'] + ']'
             try:
                 # Buffered r+ requires seeking, which terminals do not support.
                 with OUTPUT_LOCK, open("/dev/tty", "r") as tty_in, open("/dev/tty", "w") as tty_out:
@@ -1525,6 +1561,7 @@ class StreamWriter:
 
     def __init__(self, media, job, volume_size, progress, buffer_size=DEFAULT_BUFFER):
         self.media, self.job = media, job
+        self.inventory_observations = []
         self.media.protected_headers = set()
         ancestors, complete = backup_ancestry(job)
         self.media.protected_backup_ids = {job['id'], *ancestors}
@@ -1585,6 +1622,7 @@ class StreamWriter:
                 record = self.volume.next_record()
                 if record is None or hashlib.sha256(record).hexdigest() != anchor['header_sha256']:
                     raise BackupError('Append cartridge changed after validation')
+                identity = cartridge_identity(decoded_header(record), hashlib.sha256(record).hexdigest()[:32])
                 position = self.volume.seek_end()
                 if position != self.volume.append_end:
                     raise BackupError('Recorded tape end changed after append validation')
@@ -1596,6 +1634,8 @@ class StreamWriter:
                     raise BackupError('Append position disagrees with SCSI READ POSITION; refusing to write')
             self.volume.record_bytes = self.used
         else:
+            identity = new_cartridge(self.media)
+            self.media.pending_cartridge = identity
             self.media.blank_required = True
             while True:
                 self.progress.phase = f"load volume {self.number}"
@@ -1621,6 +1661,7 @@ class StreamWriter:
         first = self.pending[0] if self.pending else None
         header = encoded_header({"type": "volume", "format": 4 if self.job.get('archive_type') == 'zfs' else 3,
                                           "backup": self.job,
+                                          "cartridge_identity": identity,
                                           "volume": self.number,
                                           "sequence": first["sequence"] if first else self.sequence,
                                           "previous": first["previous"] if first else self.chain,
@@ -1631,6 +1672,11 @@ class StreamWriter:
             self.media.protected_headers.add(hashlib.sha256(header).hexdigest())
         with self.startup_operation('committing header for'):
             self.volume.commit()
+        if getattr(self.media, 'inventory_output', None):
+            if len(self.inventory_observations) >= 100000:
+                raise BackupError('Inventory observation limit exceeded')
+            self.inventory_observations.append(listing_entry(decoded_header(header),
+                                                identity['label'] or identity['id'], 'write'))
         self.media.entries.append({'id': self.job['id'], 'volume': self.number,
                                    'position': position, 'record_bytes': self.used,
                                    'header_sha256': hashlib.sha256(header).hexdigest()})
@@ -1642,7 +1688,7 @@ class StreamWriter:
             self.volume.durable_position()
         self.progress.phase = f"streaming to volume {self.number}"
         log(f"Writing {self.job['id']} volume {self.number}, chunk "
-            f"{first['sequence'] if first else self.sequence}")
+            f"{first['sequence'] if first else self.sequence}; cartridge {identity['label'] or identity['id']}")
 
     def retire(self, position):
         while self.pending and self.pending[0]["end"] is not None and self.pending[0]["end"] <= position:
@@ -1810,6 +1856,7 @@ class StreamReader:
             if job["level"] == "incremental":
                 valid_id(job["parent"])
             backup_ancestry(job)
+            self.cartridge = cartridge_identity(head)
             if job.get('archive_type') == 'zfs':
                 metadata = validate_zfs_metadata(job.get('zfs'))
                 if (job['source'] != metadata['dataset'] or
@@ -2069,6 +2116,7 @@ def inspect_backup(media, backup_id=None):
     try:
         reader.next_volume()
         return {**reader.job, "volume": reader.number, "header_verified": True,
+                "cartridge_id": reader.cartridge['id'], "cartridge_label": reader.cartridge['label'],
                 "data_verified": False, "completion_verified": False}
     finally:
         reader.close()
@@ -2185,7 +2233,8 @@ def append_resources(media):
         if getattr(media, 'append_volume', None) is not None:
             media.append_volume.close()
             media.append_volume = None
-        media.append_mode = False
+        if media is not None:
+            media.append_mode = False
 
 
 def listing_entry(head, cartridge, method):
@@ -2199,7 +2248,10 @@ def listing_entry(head, cartridge, method):
         raise BackupError('Invalid backup metadata in cartridge listing')
     if job['level'] == 'incremental':
         valid_id(job['parent'])
+    backup_ancestry(job)
+    identity = cartridge_identity(head)
     return {**job, 'volume': head['volume'], 'cartridge': cartridge,
+            'cartridge_id': identity['id'], 'cartridge_label': identity['label'],
             'header_verified': True, 'data_verified': False, 'completion_verified': False,
             'completion_marker_present': None if method == 'catalog' else False,
             'listing_method': method}
@@ -2223,15 +2275,24 @@ def catalog_listing(volume, cartridge):
             raise BackupError('Catalog backup header checksum mismatch')
         head = decoded_header(record)
         info = listing_entry(head, cartridge, 'catalog')
+        if info['cartridge_id'] is None:
+            info['cartridge_id'] = cached['entries'][0]['header_sha256'][:32]
         if info['id'] != entry['id'] or info['volume'] != entry['volume']:
             raise BackupError('Catalog backup identity differs from its header')
         results.append(info)
     if any(cached['summary'].get(k) != v for k, v in head['backup'].items()):
         raise BackupError('Metadata summary differs from the backup header')
+    # A later segment can only have been appended after its predecessor completed.
+    # These are catalog observations, not archive verification results.
+    for index, info in enumerate(results):
+        if index == len(results) - 1:
+            info['expected_volumes'] = cached['summary']['volumes']
+        elif results[index + 1]['id'] != info['id']:
+            info['expected_volumes'] = info['volume']
     return results
 
 
-def inspect_all(media, *, use_catalog=True, allow_scan=True, progress=None):
+def inspect_all(media, *, use_catalog=True, allow_scan=True, progress=None, header_fallback=False):
     results, errors = [], []
     for cartridge, volume in media.cartridges():
         if progress:
@@ -2248,6 +2309,14 @@ def inspect_all(media, *, use_catalog=True, allow_scan=True, progress=None):
                     results.extend(entries)
                     continue
                 if not allow_scan:
+                    if header_fallback:
+                        volume.seek_position(0)
+                        record = volume.next_record()
+                        if record is not None:
+                            info = listing_entry(decoded_header(record), cartridge, 'header')
+                            if info['cartridge_id'] is None:
+                                info['cartridge_id'] = hashlib.sha256(record).hexdigest()[:32]
+                            results.append(info)
                     errors.append({'cartridge': cartridge, 'scan_required': True,
                                    'error': 'No usable final catalog; use inspect --scan for a full cartridge scan'})
                     continue
@@ -2256,6 +2325,7 @@ def inspect_all(media, *, use_catalog=True, allow_scan=True, progress=None):
                 volume.record_bytes = 0
             if progress:
                 progress.phase = f'scanning backup segments on {cartridge}'
+            first_identity = None
             while True:
                 record = volume.next_record()
                 if record is None:
@@ -2263,6 +2333,9 @@ def inspect_all(media, *, use_catalog=True, allow_scan=True, progress=None):
                 head = decoded_header(record)
                 if head.get('type') == 'volume':
                     current = listing_entry(head, cartridge, 'scan')
+                    if first_identity is None:
+                        first_identity = current['cartridge_id'] or hashlib.sha256(record).hexdigest()[:32]
+                    current['cartridge_id'] = current['cartridge_id'] or first_identity
                     results.append(current)
                 elif head.get('type') == 'metadata':
                     read_metadata(volume, record)
@@ -2275,6 +2348,7 @@ def inspect_all(media, *, use_catalog=True, allow_scan=True, progress=None):
                         if digest != head['sha256']:
                             raise BackupError('Corrupt completion record')
                         current['completion_marker_present'] = True
+                        current['expected_volumes'] = current['volume']
                     else:
                         volume.skip_payload(length)
                 else:
@@ -2415,7 +2489,8 @@ def zfs_frames(metadata, buffer_size, process=None, progress=None):
 
 
 def backup_zfs(snapshot, media, *, base=None, raw=None, volume_size=None,
-               buffer_size=DEFAULT_BUFFER, quiet=False, ssh=None, verify=False):
+               buffer_size=DEFAULT_BUFFER, quiet=False, ssh=None, verify=False,
+               dry_run=False, cartridge_capacity=None):
     zfs_name(snapshot, snapshot=True)
     if not BLOCK_SIZE <= buffer_size <= MAX_BUFFER:
         raise BackupError('Buffer size must be between 64KiB and 10GiB')
@@ -2424,11 +2499,11 @@ def backup_zfs(snapshot, media, *, base=None, raw=None, volume_size=None,
     frame_size = min(FRAME_SIZE, max(BLOCK_SIZE, (buffer_size // BLOCK_SIZE - 1) * BLOCK_SIZE))
     if volume_size:
         frame_size = min(frame_size, (volume_size // BLOCK_SIZE - 2) * BLOCK_SIZE)
-    with media.lock(), ram_snapshot() as snapshot_fd, append_resources(media):
+    with (nullcontext() if dry_run and not base else media.lock()), ram_snapshot() as snapshot_fd, append_resources(media):
         parent = None
         if base:
             valid_id(base)
-            parent = prepare_append(media, base, snapshot_fd)
+            parent = inspect_backup(media, base) if dry_run else prepare_append(media, base, snapshot_fd)
             if parent.get('archive_type') != 'zfs' or parent.get('ssh') != (ssh.metadata if ssh else None):
                 raise BackupError('ZFS incremental requires a ZFS parent from the same source host')
             validate_zfs_metadata(parent.get('zfs'))
@@ -2440,6 +2515,10 @@ def backup_zfs(snapshot, media, *, base=None, raw=None, volume_size=None,
             metadata = remote.prepare() if remote else prepare_zfs(snapshot, **options)
             if parent and parent['source'] != metadata['source']:
                 raise BackupError('ZFS source differs from parent backup')
+            if dry_run:
+                return backup_preview(metadata['source'], 'incremental' if base else 'full', base,
+                                      metadata['estimated_bytes'], buffer_size, cartridge_capacity or volume_size,
+                                      zfs=metadata['zfs'], ssh=ssh)
             return write_backup(metadata['source'], media, 'incremental' if base else 'full', base,
                                 volume_size, buffer_size, quiet, snapshot_fd, metadata['estimated_bytes'],
                                 remote, frame_size, zfs=metadata['zfs'], parent_job=parent, verify=verify)
@@ -2871,7 +2950,8 @@ def serve_ssh_source():
 
 
 def backup(source, media, *, level="full", base=None, volume_size=None,
-           buffer_size=DEFAULT_BUFFER, quiet=False, ssh=None, append=False, excludes=None, verify=False):
+           buffer_size=DEFAULT_BUFFER, quiet=False, ssh=None, append=False, excludes=None, verify=False,
+           dry_run=False, cartridge_capacity=None):
     source = Path(source) if ssh else Path(source).resolve()
     if ssh and not source.is_absolute():
         raise BackupError("SSH --source must be an absolute path on the remote machine")
@@ -2898,13 +2978,13 @@ def backup(source, media, *, level="full", base=None, volume_size=None,
         frame_size = min(frame_size, (volume_size // BLOCK_SIZE - 2) * BLOCK_SIZE)
     if not ssh:
         require_tar()
-    with media.lock(), ram_snapshot() as snapshot_fd, append_resources(media):
+    with (nullcontext() if dry_run and not base else media.lock()), ram_snapshot() as snapshot_fd, append_resources(media):
         parent = None
         parent_created = None
         if base:
             valid_id(base)
             log(f"Loading the incremental snapshot from backup {base}")
-            parent = (prepare_append(media, base, snapshot_fd) if append else
+            parent = (inspect_backup(media, base) if dry_run else prepare_append(media, base, snapshot_fd) if append else
                       scan(media, base, snapshot_fd, verify=False))
             if parent.get("ssh") != (ssh.metadata if ssh else None):
                 raise BackupError("Incremental SSH source differs from the parent backup")
@@ -2927,6 +3007,9 @@ def backup(source, media, *, level="full", base=None, volume_size=None,
                 estimated_bytes = estimate_source(source, parent_created, excludes)
             if parent and parent["source"] != str(source):
                 raise BackupError("Incremental source differs from the parent backup")
+            if dry_run:
+                return backup_preview(source, level, base, estimated_bytes, buffer_size,
+                                      cartridge_capacity or volume_size, excludes=excludes, ssh=ssh)
             return write_backup(source, media, level, base, volume_size, buffer_size, quiet,
                                 snapshot_fd, estimated_bytes, remote, frame_size, excludes=excludes,
                                 parent_job=parent, verify=verify)
@@ -3008,6 +3091,17 @@ def write_backup(source, media, level, base, volume_size, buffer_size, quiet,
             media.last_result = {**job, **end, 'volumes': writer.number, 'archive_complete': True,
                                  'metadata_complete': metadata_complete, 'append_ready': append_ready,
                                  'data_verified': False, 'warnings': warnings}
+            if getattr(media, 'inventory_output', None):
+                try:
+                    for entry in writer.inventory_observations:
+                        entry['expected_volumes'] = writer.number
+                    update_inventory(media.inventory_output, writer.inventory_observations)
+                    media.last_result['inventory_updated'] = True
+                except (BackupError, OSError) as exc:
+                    media.last_result['inventory_updated'] = False
+                    warning = f'Backup committed, but optional inventory update failed: {exc}'
+                    warnings.append(warning)
+                    log(warning)
             if verify:
                 log(f"Committed {job['id']}; starting read-back verification")
                 # The source and catalog have finished using both RAM snapshots.
@@ -3277,6 +3371,220 @@ def parse_size(value):
     return size
 
 
+def inventory_document(entries):
+    """Validate a bounded, advisory inventory. Never use it to authorize tape writes."""
+    if not isinstance(entries, list) or len(entries) > 100000:
+        raise BackupError('Invalid or oversized inventory entries')
+    identities = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise BackupError('Invalid inventory entry')
+        valid_id(entry.get('id'))
+        valid_id(entry.get('cartridge_id'))
+        if entry.get('cartridge_label') is not None:
+            valid_label(entry['cartridge_label'])
+        if (type(entry.get('volume')) is not int or not 0 < entry['volume'] <= 100000 or
+                not isinstance(entry.get('source'), str) or entry.get('level') not in ('full', 'incremental')):
+            raise BackupError('Invalid inventory backup or volume')
+        if entry.get('expected_volumes') is not None and (
+                type(entry['expected_volumes']) is not int or
+                not entry['volume'] <= entry['expected_volumes'] <= 100000):
+            raise BackupError('Invalid inventory volume count')
+        if (entry['level'] == 'full') != (entry.get('parent') is None):
+            raise BackupError('Invalid inventory parent')
+        if entry.get('parent') is not None:
+            valid_id(entry['parent'])
+        backup_ancestry(entry)
+        if entry.get('archive_type', 'tar') not in ('tar', 'zfs'):
+            raise BackupError('Invalid inventory archive type')
+        if entry.get('archive_type') == 'zfs':
+            zfs = validate_zfs_metadata(entry.get('zfs'))
+            if (zfs['dataset'] != entry['source'] or
+                    (entry['level'] == 'full') != (zfs['base_snapshot'] is None)):
+                raise BackupError('Inventory ZFS identity differs from backup metadata')
+        if entry.get('created') is not None:
+            if not isinstance(entry['created'], str):
+                raise BackupError('Invalid inventory timestamp')
+            try:
+                datetime.fromisoformat(entry['created'])
+            except ValueError as exc:
+                raise BackupError('Invalid inventory timestamp') from exc
+        if entry.get('ssh') is not None:
+            if not isinstance(entry['ssh'], dict) or not isinstance(entry['ssh'].get('host'), str):
+                raise BackupError('Invalid inventory SSH identity')
+            port = entry['ssh'].get('port')
+            if port is not None and (type(port) is not int or not 1 <= port <= 65535):
+                raise BackupError('Invalid inventory SSH port')
+        for key in ('estimated_bytes', 'data_bytes', 'volumes'):
+            if key in entry and (type(entry[key]) is not int or entry[key] < 0):
+                raise BackupError('Invalid inventory size or count')
+        policy = {key: entry.get(key) for key in ('source', 'parent', 'level', 'ssh', 'zfs',
+                                                 'ancestors', 'ancestry_complete')}
+        policy['archive_type'] = entry.get('archive_type', 'tar')
+        policy['excludes'] = normalize_exclusions(entry.get('excludes', []))
+        previous = identities.setdefault(entry['id'], policy)
+        if previous != policy:
+            raise BackupError('Conflicting inventory metadata for backup ' + entry['id'])
+    return {'version': 1, 'backups': [{**entry, 'data_verified': False, 'completion_verified': False}
+                                    for entry in entries], 'advisory': True, 'data_verified': False}
+
+
+def read_inventory(path):
+    try:
+        with open(path, 'rb') as stream:
+            raw = stream.read(MAX_CATALOG_BYTES + 1)
+        if len(raw) > MAX_CATALOG_BYTES:
+            raise BackupError('Inventory exceeds 64 MiB')
+        document = json.loads(raw)
+        if not isinstance(document, dict) or document.get('version') != 1:
+            raise BackupError('Unsupported inventory version')
+        return inventory_document(document.get('backups'))
+    except (ValueError, TypeError, KeyError) as exc:
+        raise BackupError(f'Invalid inventory: {exc}') from exc
+
+
+def update_inventory(path, observations):
+    """Merge observed cartridges atomically; missing/incomplete reads cannot remove entries."""
+    path = Path(path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with shared_lock(path.with_name(path.name + '.lock'), 'inventory lock', 'Inventory is in use'):
+        old = read_inventory(path)['backups'] if path.exists() else []
+        # Only replace the segments actually observed; retaining old observations
+        # is intentional. They are hints, and may describe media since erased.
+        combined = {(e['cartridge_id'], e['id'], e['volume']): e for e in old}
+        for entry in observations:
+            combined[(entry['cartridge_id'], entry['id'], entry['volume'])] = entry
+        document = inventory_document(list(combined.values()))
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=path.parent, prefix='.' + path.name + '-', delete=False) as stream:
+                temporary = Path(stream.name)
+                size = 1
+                for part in json.JSONEncoder(indent=2).iterencode(document):
+                    data = part.encode()
+                    size += len(data)
+                    if size > MAX_CATALOG_BYTES:
+                        raise BackupError('Inventory exceeds 64 MiB')
+                    stream.write(data)
+                stream.write(b'\n')
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            fsync_dir(path.parent)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        return document
+
+
+def restore_plan(target, entries):
+    """Plan from observations only; actual restore still validates each tape."""
+    valid_id(target)
+    inventory_document(entries)
+    by_id = {}
+    for entry in entries:
+        by_id.setdefault(entry['id'], []).append(entry)
+    reverse, missing, problems = [], [], []
+    target_job = by_id.get(target, [None])[0]
+    ancestors, ancestry_complete = backup_ancestry(target_job) if target_job else ([], False)
+    if ancestry_complete:
+        reverse = [target, *ancestors]
+        missing = [identifier for identifier in reverse if identifier not in by_id]
+        for index, identifier in enumerate(reverse):
+            if identifier in by_id and by_id[identifier][0]['parent'] != (
+                    reverse[index + 1] if index + 1 < len(reverse) else None):
+                raise BackupError('Recorded ancestry differs from restore chain')
+    identifier = target
+    while not ancestry_complete and identifier is not None:
+        if identifier in reverse:
+            raise BackupError('Cycle in restore chain')
+        if len(reverse) >= 100000:
+            raise BackupError('Restore chain exceeds inventory limit')
+        reverse.append(identifier)
+        observed = by_id.get(identifier)
+        if not observed:
+            missing.append(identifier)
+            break
+        identifier = observed[0]['parent']
+    order = list(reversed(reverse))
+    jobs = []
+    previous = None
+    for identifier in order:
+        copies = by_id.get(identifier, [])
+        if not copies:
+            continue
+        job = copies[0]
+        if previous is not None:
+            for key, default in (('source', None), ('ssh', None), ('archive_type', 'tar'), ('excludes', [])):
+                if job.get(key, default) != previous.get(key, default):
+                    raise BackupError('Restore chain changes source, archive type, or exclusions')
+            if job.get('zfs') and job['parent'] == previous['id'] and (job['zfs']['base_guid'] != previous['zfs']['guid'] or
+                                   job['zfs']['raw'] != previous['zfs']['raw']):
+                raise BackupError('Restore chain changes ZFS snapshot identity')
+        ancestors, complete = backup_ancestry(job)
+        if complete and not missing and ancestors != list(reversed(order[:order.index(identifier)])):
+            raise BackupError('Recorded ancestry differs from restore chain')
+        totals = {entry['expected_volumes'] for entry in copies if entry.get('expected_volumes') is not None}
+        if len(totals) > 1:
+            raise BackupError('Conflicting inventory volume counts')
+        total = next(iter(totals), None)
+        observed_numbers = {entry['volume'] for entry in copies}
+        absent = sorted(set(range(1, total + 1)) - observed_numbers) if total else []
+        if total is None:
+            problems.append(f'{identifier}: final volume count is unknown; inventory its final cartridge')
+        elif absent:
+            problems.append(f'{identifier}: missing volume observations ' + ', '.join(map(str, absent)))
+        if total is not None and max(observed_numbers) > total:
+            raise BackupError('Observed volume exceeds recorded final volume count')
+        jobs.append({'id': identifier, 'level': job['level'], 'source': job['source'],
+                     'archive_type': job.get('archive_type', 'tar'), 'parent': job['parent'],
+                     'expected_volumes': total, 'missing_volumes': absent,
+                     'cartridges': [{'volume': entry['volume'], 'id': entry['cartridge_id'],
+                                     'label': entry.get('cartridge_label')} for entry in
+                                    sorted(copies, key=lambda e: (e['volume'], e['cartridge_id']))]})
+        previous = job
+    return {'target': target, 'backup_ids': order, 'backups': jobs, 'missing_backups': missing,
+            'warnings': problems, 'plan_complete': not missing and not problems,
+            'data_verified': False, 'advisory': True}
+
+
+def format_restore_plan(result):
+    lines = [f'Restore plan for {result["target"]}', 'Inventory observations only; tape contents are rechecked during restore.']
+    for number, job in enumerate(result['backups'], 1):
+        lines.append(f'{number}. {job["level"]} {job["id"]} ({job["archive_type"]})')
+        for cartridge in job['cartridges']:
+            lines.append(f'   Volume {cartridge["volume"]}: {cartridge["label"] or "unlabeled"} [{cartridge["id"]}]')
+    lines.extend('Missing backup: ' + identifier for identifier in result['missing_backups'])
+    lines.extend('Unresolved: ' + warning for warning in result['warnings'])
+    lines.append('Plan complete; archive data not verified.' if result['plan_complete'] else 'Plan incomplete; collect the missing cartridge metadata.')
+    return '\n'.join(lines)
+
+
+def backup_preview(source, level, base, estimate, buffer_size, capacity, *, excludes=None, zfs=None, ssh=None):
+    return {'dry_run': True, 'source': str(source), 'level': level, 'parent': base,
+            'archive_type': 'zfs' if zfs else 'tar', 'zfs': zfs,
+            'ssh': ssh.metadata if ssh else None, 'excludes': excludes or [],
+            'estimated_bytes': estimate, 'buffer_size': buffer_size,
+            'cartridge_capacity': capacity,
+            'estimated_fresh_cartridges': ((estimate + capacity - 1) // capacity) if capacity else None,
+            'tape_readiness_checked': False, 'data_verified': False,
+            'notes': ['Preview only; no archive stream or tape writes.',
+                      'Incremental selection and size are estimates, not an exact changed-file list.',
+                      'Cartridge count assumes empty cartridges and no hardware compression; '
+                      'framing, recovery, metadata, and existing tape contents affect the actual count.',
+                      'Actual backup rechecks the source, parent, and writable tape position.']}
+
+
+def format_backup_preview(result):
+    rows = [('Source', result['source']), ('Type', result['level'] + ' / ' + result['archive_type']),
+            ('Parent', result['parent']), ('Estimated archive', readable_size(result['estimated_bytes'])),
+            ('Buffer budget (each)', readable_size(result['buffer_size'])),
+            ('Exclusions', ', '.join(result['excludes']) or 'None'),
+            ('Estimated empty cartridges', result['estimated_fresh_cartridges']),
+            *[('Note', note) for note in result['notes']]]
+    return detail_rows('Backup preview', rows, terminal_width(sys.stdout))
+
+
 def make_parser():
     parser = argparse.ArgumentParser(description=__doc__, usage='%(prog)s COMMAND [OPTIONS]',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3285,8 +3593,11 @@ def make_parser():
   backup --source /opt --level incremental --base ID
                                                 Append changes to the last backup
   inspect                                      List backups from tape metadata
+  inventory --output tapes.json                Collect cartridge and backup information
   list --backup ID                             List archived file names
   restore --backup FULL_ID DELTA_ID --destination /srv/recovered
+  restore --to ID --plan --inventory tapes.json Show the required restore chain
+  backup --source /opt --dry-run                Preview without writing tape
 
 Native ZFS snapshots (existing snapshots; no file exclusions):
   zfs-backup --snapshot tank/books@daily
@@ -3306,6 +3617,7 @@ Default device: /dev/nst0. Tapes stay loaded until you run eject.''')
         group.add_argument("--device", default="/dev/nst0", help="Tape device (default: /dev/nst0)")
         group.add_argument("--media-dir", type=Path, help="Use files as simulated tape volumes")
         command.add_argument("--media-command", help="Loader executable; arguments: write|read|append|blank ID NUMBER DEVICE")
+        command.add_argument('--inventory', type=Path, help='Optional inventory JSON; backups update it, readers use cartridge hints')
 
     def ssh_options(command):
         command.add_argument('--ssh', metavar='USER@HOST', help='Read the source over SSH')
@@ -3341,11 +3653,18 @@ Default device: /dev/nst0. Tapes stay loaded until you run eject.''')
     create.add_argument("--quiet", action="store_true", help="Suppress file names; keep progress and transfer rates")
     create.add_argument('--json', action='store_true', help='Print a structured completion summary instead of only the backup ID')
     create.add_argument('--verify', action='store_true', help='Read back and verify all volumes after backup')
+    create.add_argument('--dry-run', action='store_true', help='Preview source and size without starting an archive or writing tape')
+    create.add_argument('--cartridge-capacity', type=parse_size, help='Capacity for preview estimates only; requires --dry-run')
+    create.add_argument('--label-prefix', help='Label new cartridges PREFIX-001, PREFIX-002, etc.; append retains the existing label')
     media_options(create)
     extract = commands.add_parser("restore", help="Stream tapes directly into a restored directory")
-    extract.add_argument("--backup", nargs="+", required=True, help="Full chain for a new restore, or next incremental ID(s) for an existing restore")
+    selection = extract.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--backup", nargs="+", help="Full chain for a new restore, or next incremental ID(s) for an existing restore")
+    selection.add_argument('--to', help='Discover the full chain ending at this ID from cartridge metadata or --inventory')
+    extract.add_argument('--plan', action='store_true', help='With --to, show the chain and required cartridges without restoring')
+    information_options(extract)
     extract.add_argument('--base', help='Last backup already restored here; only needed to adopt an older restore without history')
-    extract.add_argument("--destination", required=True, type=Path)
+    extract.add_argument("--destination", type=Path)
     extract.add_argument("--quiet", action="store_true", help="Suppress file names; keep progress and transfer rates")
     media_options(extract)
     zcreate = commands.add_parser('zfs-backup', help='Stream an existing ZFS snapshot; --base appends an incremental')
@@ -3359,12 +3678,24 @@ Default device: /dev/nst0. Tapes stay loaded until you run eject.''')
     zcreate.add_argument('--quiet', action='store_true')
     zcreate.add_argument('--json', action='store_true', help='Print a structured completion summary')
     zcreate.add_argument('--verify', action='store_true', help='Read back and verify all volumes after backup')
+    zcreate.add_argument('--dry-run', action='store_true', help='Validate snapshot and estimate send size without streaming or writing tape')
+    zcreate.add_argument('--cartridge-capacity', type=parse_size, help='Capacity for preview estimates only; requires --dry-run')
+    zcreate.add_argument('--label-prefix', help='Label new cartridges PREFIX-001, PREFIX-002, etc.')
     ssh_options(zcreate)
     media_options(zcreate)
     zextract = commands.add_parser('zfs-restore', help='Verify and receive native ZFS backups into an unmounted dataset')
-    zextract.add_argument('--backup', nargs='+', required=True, help='Full chain, or next incremental IDs')
-    zextract.add_argument('--dataset', required=True, metavar='POOL/DATASET', help='New dataset for a full restore')
+    selection = zextract.add_mutually_exclusive_group(required=True)
+    selection.add_argument('--backup', nargs='+', help='Full chain, or next incremental IDs')
+    selection.add_argument('--to', help='Discover the full chain ending at this ID from cartridge metadata or --inventory')
+    zextract.add_argument('--plan', action='store_true', help='With --to, show the chain without receiving data')
+    zextract.add_argument('--dataset', metavar='POOL/DATASET', help='New dataset for a full restore')
+    information_options(zextract)
     media_options(zextract)
+    inventory = commands.add_parser('inventory', help='Collect cartridge labels and backup headers into an optional JSON inventory')
+    inventory.add_argument('--output', type=Path, help='Atomically merge observations into this inventory file')
+    inventory.add_argument('--scan', action='store_true', help='Allow archive scans when a catalog is unavailable (can take hours)')
+    information_options(inventory)
+    media_options(inventory)
     listing = commands.add_parser('list', help='List file names in one backup without extracting (reads all volumes)')
     listing.add_argument('--backup', help='Backup ID; omit to discover the first backup on the loaded tape')
     media_options(listing)
@@ -3453,16 +3784,70 @@ def main(argv=None):
                 raise BackupError("SSH options require --ssh USER@HOST")
         if args.media_dir and args.media_command:
             raise BackupError("--media-command only applies to physical tapes")
-        media = FileMedia(args.media_dir) if args.media_dir else TapeMedia(args.device, args.media_command)
+        creating = args.command in ('backup', 'zfs-backup')
+        if args.command in ('restore', 'zfs-restore'):
+            if args.plan and not args.to:
+                raise BackupError('--plan requires --to BACKUP_ID')
+            if args.output_format and not args.plan:
+                raise BackupError('--json/--text on restore requires --plan')
+            if not args.plan and not (args.destination if args.command == 'restore' else args.dataset):
+                raise BackupError('Restore requires --destination' if args.command == 'restore' else 'ZFS restore requires --dataset')
+        inventory = (read_inventory(args.inventory)['backups'] if args.inventory and
+                     (args.inventory.exists() or not creating) else [] if args.inventory else None)
+        preview_only = args.command in ('backup', 'zfs-backup') and args.dry_run and not args.base
+        planning_only = args.command in ('restore', 'zfs-restore') and args.plan and inventory is not None
+        media = (None if preview_only or planning_only else
+                 FileMedia(args.media_dir) if args.media_dir else TapeMedia(args.device, args.media_command))
+        if media is not None:
+            media.inventory_entries = inventory or []
+            if creating and not args.dry_run:
+                media.inventory_output = args.inventory
+        if args.command in ('backup', 'zfs-backup'):
+            if args.cartridge_capacity and not args.dry_run:
+                raise BackupError('--cartridge-capacity is for --dry-run estimates; use --volume-size for test rollover')
+            if args.label_prefix:
+                valid_label(args.label_prefix)
+                if len(args.label_prefix) > 40:
+                    raise BackupError('--label-prefix must be at most 40 characters')
+                if media is not None:
+                    media.label_prefix = args.label_prefix
+        if args.command in ('restore', 'zfs-restore'):
+            if args.to:
+                if args.command == 'restore' and args.base:
+                    raise BackupError('--to selects a full chain; use --backup with --base for stepwise restores')
+                if inventory is None:
+                    with media.lock():
+                        inventory = inspect_all(media, allow_scan=False, header_fallback=True)['backups']
+                plan = restore_plan(args.to, inventory)
+                if args.plan:
+                    print(information_output(plan, format_restore_plan, args.output_format))
+                    return 0 if plan['plan_complete'] else 2
+                if not plan['plan_complete']:
+                    raise BackupError('Restore plan is incomplete; run with --plan and collect the missing cartridge metadata')
+                expected_type = 'tar' if args.command == 'restore' else 'zfs'
+                if any(job['archive_type'] != expected_type for job in plan['backups']):
+                    raise BackupError('Restore command does not match the planned archive type')
+                args.backup = plan['backup_ids']
+                media.inventory_entries = inventory
+        if args.command == 'inventory':
+            with media.lock():
+                observations = inspect_all(media, allow_scan=args.scan, header_fallback=True)
+            result = (update_inventory(args.output, observations['backups']) if args.output else
+                      inventory_document(observations['backups']))
+            result.update(scan_complete=observations['scan_complete'], errors=observations['errors'])
+            print(information_output(result, format_backup_info, args.output_format))
+            return 0 if observations['scan_complete'] else 2
         if args.command == "backup":
             size = args.volume_size or (1024**3 if args.media_dir else None)
             result = backup(args.source, media, level=args.level, base=args.base,
                             volume_size=size, buffer_size=args.buffer_size, quiet=args.quiet, ssh=ssh,
-                            append=args.append, excludes=excludes, verify=args.verify)
+                            append=args.append, excludes=excludes, verify=args.verify,
+                            dry_run=args.dry_run, cartridge_capacity=args.cartridge_capacity)
         elif args.command == 'zfs-backup':
             result = backup_zfs(args.snapshot, media, base=args.base, raw=args.raw,
                                 volume_size=args.volume_size or (1024**3 if args.media_dir else None),
-                                buffer_size=args.buffer_size, quiet=args.quiet, ssh=ssh, verify=args.verify)
+                                buffer_size=args.buffer_size, quiet=args.quiet, ssh=ssh, verify=args.verify,
+                                dry_run=args.dry_run, cartridge_capacity=args.cartridge_capacity)
         elif args.command == 'zfs-restore':
             result = restore_zfs(args.backup, args.dataset, media)
         elif args.command == "restore":
@@ -3487,7 +3872,9 @@ def main(argv=None):
                     result = scan(media, args.backup)
             result = information_output(result, format_backup_info, args.output_format)
         if args.command in ('backup', 'zfs-backup'):
-            if args.json:
+            if args.dry_run:
+                result = json.dumps(result, indent=2) if args.json else format_backup_preview(result)
+            elif args.json:
                 result = json.dumps(media.last_result, indent=2)
         print(result)
         return 0
@@ -3501,16 +3888,22 @@ def main(argv=None):
         elif args is not None and args.command == 'compression':
             log('Compression command interrupted; run compression status to check the drive setting.')
         elif args is not None and args.command in ('restore', 'zfs-restore'):
-            log('Restore interrupted. If an incremental apply began, restore the full chain '
-                'into a separate directory; an incomplete apply cannot be continued.')
+            if args.plan:
+                log('Restore planning interrupted; no destination was modified.')
+            else:
+                log('Restore interrupted. If an incremental apply began, restore the full chain '
+                    'into a separate directory; an incomplete apply cannot be continued.')
         elif args is not None and args.command == 'list':
             log('File listing interrupted; output may be incomplete.')
-        elif args is not None and args.command in ('inspect', 'verify'):
+        elif args is not None and args.command in ('inspect', 'verify', 'inventory'):
             log(f'{args.command.capitalize()} interrupted; the operation did not complete.')
-        elif (args is not None and args.command in ('backup', 'zfs-backup') and args.verify and
+        elif (args is not None and args.command in ('backup', 'zfs-backup') and
               getattr(media, 'last_result', {}).get('archive_complete')):
-            log(f"Backup {media.last_result['id']} was committed; read-back verification interrupted. "
+            stage = 'read-back verification' if args.verify else 'post-backup reporting'
+            log(f"Backup {media.last_result['id']} was committed; {stage} interrupted. "
                 'Run verify for this backup to check it.')
+        elif args is not None and args.command in ('backup', 'zfs-backup') and args.dry_run:
+            log('Backup preview interrupted; no archive was written.')
         else:
             log("Interrupted. Preserve existing tapes; an incomplete tail cannot be appended to. "
                 "Start a new full backup on separate media, or repeat restore from the first tape.")

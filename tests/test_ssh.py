@@ -67,6 +67,18 @@ class SSHTests(unittest.TestCase):
                          buffer_size=10 * 1024**3, quiet=True)
         self.restore([full])
 
+    def test_remote_preview_does_not_start_stream_and_keeps_incremental_tape_unchanged(self):
+        preview = tb.backup(self.source, None, ssh=self.ssh, dry_run=True, excludes=['old-dir'])
+        self.assertTrue(preview['dry_run'])
+        self.assertEqual(preview['excludes'], ['old-dir'])
+        self.assertFalse(self.media.directory.exists())
+        full = self.create()
+        before = tree_contents(self.media.directory)
+        preview = tb.backup(self.source, self.media, level='incremental', base=full,
+                            ssh=self.ssh, dry_run=True)
+        self.assertEqual(preview['parent'], full)
+        self.assertEqual(tree_contents(self.media.directory), before)
+
     def test_remote_stream_continues_after_rejecting_a_used_continuation_tape(self):
         media = SimulatedTapeMedia(capacity=12)
         used = Cartridge()

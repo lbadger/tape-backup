@@ -59,13 +59,14 @@ class BinaryTests(unittest.TestCase):
         self.assertEqual(actual, expected)
 
     def test_relocated_binary_without_python_full_and_incremental_restore(self):
-        self.assertEqual(self.run_binary("--version"), "tape-backup 2.1.1")
+        self.assertEqual(self.run_binary("--version"), "tape-backup 2.2.0")
         self.assertIn("/dev/nst0", self.run_binary("backup", "--help"))
         self.assertNotIn('--volume-size', self.run_binary('backup', '--help'))
         full = self.run_binary(*self.backup_args)
         self.assertIn("./change", self.last_stderr)
         self.assertIn("MiB/s", self.last_stderr)
         self.assertIn("ETA", self.last_stderr)
+
         self.assertIn('Total 100.0% (complete)', self.last_stderr)
         self.assertGreater(len(list(self.media.glob(f"{full}.*.tape"))), 1)
         names = self.run_binary('list', '--media-dir', self.media).splitlines()
@@ -85,6 +86,23 @@ class BinaryTests(unittest.TestCase):
         self.assertFalse(list(self.root.rglob("*.snar")))
         self.assertEqual(list(self.root.rglob('*.json')),
                          [tb.restore_marker_path(self.root / 'restored')])
+
+    def test_preview_labels_inventory_and_automatic_restore_chain(self):
+        inventory = self.root / 'inventory.json'
+        preview = json.loads(self.run_binary('backup', '--source', self.source, '--dry-run', '--json'))
+        self.assertTrue(preview['dry_run'])
+        self.assertFalse(self.media.exists())
+        full = self.run_binary(*self.backup_args, '--label-prefix', 'BOOKS', '--inventory', inventory)
+        (self.source / 'change').write_text('changed')
+        delta = self.run_binary(*self.backup_args, '--level', 'incremental', '--base', full, '--inventory', inventory)
+        plan = json.loads(self.run_binary('restore', '--to', delta, '--plan', '--inventory', inventory, '--json'))
+        self.assertTrue(plan['plan_complete'])
+        self.assertEqual(plan['backup_ids'], [full, delta])
+        self.assertTrue(plan['backups'][0]['cartridges'][0]['label'].startswith('BOOKS-'))
+        self.run_binary('restore', '--to', delta, '--inventory', inventory,
+                        '--media-dir', self.media, '--destination', self.root / 'planned-restore')
+        self.assertEqual({p.name: p.read_bytes() for p in self.source.iterdir()},
+                         {p.name: p.read_bytes() for p in (self.root / 'planned-restore').iterdir()})
 
     def test_binary_displays_total_bar_for_backup_and_restore_on_a_terminal(self):
         def run(*args):

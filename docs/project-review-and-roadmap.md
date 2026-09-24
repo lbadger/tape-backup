@@ -55,6 +55,13 @@ preserve those while making operation and recovery easier to understand.
 
 ## Evidence and current strengths
 
+**v2.2.0** implements cartridge recording identities/labels, optional inventories,
+metadata restore plans and `--to` chain discovery, and non-writing local/SSH tar
+and ZFS previews. Inventory writes are optional and happen after backup commit;
+restores continue validating actual tape contents. File indexes, selective
+restore, scheduling profiles, emergency export, and interruption checkpoints
+remain future work.
+
 **v2.1.1** closes the older-ancestor wipe gap with persistent bounded ancestry and
 conservative handling of incomplete older chains. It avoids payload scans for
 catalog-confirmed negative lookups, fixes standalone/read-back progress, and

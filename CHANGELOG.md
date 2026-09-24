@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.2.0 — 2026-09-24
+
+- Record cartridge IDs and readable labels as optional volume-header metadata.
+  Preserve identities during appends, assign new identities to continuation
+  cartridges, and keep older tapes readable without rewriting their headers.
+- Add optional atomic JSON inventories, updated after backup commit or rebuilt
+  with `inventory`. Default discovery reads catalogs/first headers; full scans
+  remain explicit. Inventory label hints never authorize tape writes.
+- Add `restore --to ID --plan` and the equivalent ZFS workflow. Report missing
+  backups/volumes and unknown counts; complete plans can drive existing full-chain
+  restore validation. Explicit-ID and stepwise recovery remain supported.
+- Add local/SSH tar and ZFS `--dry-run` previews with exclusions, parent identity,
+  archive estimates, buffer budgets, and optional cartridge-count estimates.
+  Previews start no archive stream and perform no tape writes.
+
 ## 2.1.1 — 2026-09-24
 
 - Carry a bounded ancestor list in new backup headers and catalog summaries.

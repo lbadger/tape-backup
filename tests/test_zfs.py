@@ -68,6 +68,21 @@ class ZFSStreamTests(unittest.TestCase):
         with self.assertRaises(tb.BackupError):
             tb.scan(self.media, backup_id)
 
+    def test_zfs_preview_and_multivolume_plan_without_starting_another_send(self):
+        first = identity()
+        full = self.create(first, limit=512 * 1024)
+        second = identity('tank/books@two', '1002', first)
+        with patch.object(tb, 'prepare_zfs', return_value={'source': second['dataset'],
+                'estimated_bytes': 800000, 'zfs': second}), \
+                patch.object(tb, 'start_zfs', side_effect=AssertionError('started send')):
+            preview = tb.backup_zfs(second['snapshot'], self.media, base=full, dry_run=True)
+        self.assertEqual(preview['parent'], full)
+        delta = self.create(second, base=full, limit=512 * 1024)
+        entries = tb.inspect_all(self.media, allow_scan=True)['backups']
+        plan = tb.restore_plan(delta, entries)
+        self.assertTrue(plan['plan_complete'])
+        self.assertEqual(plan['backup_ids'], [full, delta])
+
     def test_tar_listing_and_restore_reject_native_stream_before_spawning_tar(self):
         full = self.create(identity())
         with redirect_stdout(io.StringIO()), self.assertRaisesRegex(tb.BackupError, 'ZFS streams'):
@@ -249,14 +264,23 @@ class ZFSKernelTests(unittest.TestCase):
             result = subprocess.run([binary, *map(str, args)], capture_output=True, text=True, timeout=120)
             self.assertEqual(result.returncode, 0, result.stderr)
             return result.stdout.strip()
-        common = ['--media-dir', self.media.directory, '--buffer-size', '64KiB', '--volume-size', '512KiB']
-        full = json.loads(run('zfs-backup', '--snapshot', self.snapshot('one'), *common, '--json', '--verify'))
+        inventory = self.root / 'inventory.json'
+        common = ['--media-dir', self.media.directory, '--buffer-size', '64KiB', '--volume-size', '512KiB',
+                  '--inventory', inventory, '--label-prefix', 'ZFS']
+        first_snapshot = self.snapshot('one')
+        preview = json.loads(run('zfs-backup', '--snapshot', first_snapshot, '--dry-run', '--json'))
+        self.assertTrue(preview['dry_run'])
+        self.assertFalse(self.media.directory.exists())
+        full = json.loads(run('zfs-backup', '--snapshot', first_snapshot, *common, '--json', '--verify'))
         self.assertTrue(full['data_verified'])
         (self.source / 'deleted').unlink()
         (self.source / 'new').write_text('binary incremental')
         delta = run('zfs-backup', '--snapshot', self.snapshot('two'), '--base', full['id'], *common)
+        plan = json.loads(run('zfs-restore', '--to', delta, '--plan', '--inventory', inventory, '--json'))
+        self.assertTrue(plan['plan_complete'])
+        self.assertEqual(plan['backup_ids'], [full['id'], delta])
         target = self.dataset + '/binary-restored'
-        run('zfs-restore', '--backup', full['id'], delta, '--dataset', target,
+        run('zfs-restore', '--to', delta, '--inventory', inventory, '--dataset', target,
             '--media-dir', self.media.directory)
         self.assertEqual(tree_contents(self.view(target, 'binary-restored')), tree_contents(self.source))
 
