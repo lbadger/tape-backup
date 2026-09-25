@@ -59,7 +59,7 @@ class BinaryTests(unittest.TestCase):
         self.assertEqual(actual, expected)
 
     def test_relocated_binary_without_python_full_and_incremental_restore(self):
-        self.assertEqual(self.run_binary("--version"), "tape-backup 2.2.0")
+        self.assertEqual(self.run_binary("--version"), "tape-backup 2.3.0")
         self.assertIn("/dev/nst0", self.run_binary("backup", "--help"))
         self.assertNotIn('--volume-size', self.run_binary('backup', '--help'))
         full = self.run_binary(*self.backup_args)

@@ -26,7 +26,7 @@ executable reports `2.0.0` to distinguish it from earlier local builds.
 Recorded continuation cartridges are refused before writing, and the same volume
 is requested again while the source and recovery buffers remain live. Both manual
 prompts and loader commands can supply another cartridge or cancel. There is no
-automatic erase/eject, and header write or commit failures are not treated as a
+automatic erase, and header write or commit failures are not treated as a
 rejected-cartridge retry. Process exit still loses the RAM-only continuation state.
 Initialize previously used continuation cartridges ahead of time with the explicit
 `wipe` command. It uses the drive lock, erases only after confirmation (or `--yes`),
@@ -121,16 +121,19 @@ Footer rollover onto a separate cartridge is not implemented.
 ## Rollover and interrupted writes
 
 Once the new header is committed, end-of-medium and recoverable write/flush
-failures use the existing bounded replay window. Prompt for blank media and
-continue the same backup ID with its next volume number. Preserve all earlier
-cartridges and their committed records. No automatic eject occurs. The loader
+failures use the existing bounded replay window. Close the tape stream, rewind
+and eject the cartridge, then request blank media and continue the same backup ID
+with its next volume number. Preserve all earlier cartridges and their committed
+records. If eject fails, report the error and continue to the prompt or loader
+with the buffered data retained. The loader
 receives the distinct action `blank`, never the overwrite-authorizing `write`
 action. Before writing a continuation, hold the device open for reading/writing,
 check that recorded EOD is position zero with no readable record, and rewind that
 blank cartridge. Recorded media and ambiguous/read-error states are refused.
 
 If the configured cap leaves insufficient space even to start the new segment,
-request blank media and start volume 1 there. An actual header write/commit
+rewind and eject the base cartridge, request blank media, and start volume 1 there.
+The final cartridge stays loaded when the backup completes. An actual header write/commit
 failure aborts, without silently skipping a numbered volume or overwriting the base.
 
 An interrupted append leaves earlier completed recovery points available.

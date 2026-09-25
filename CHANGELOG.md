@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.3.0 — 2026-09-25
+
+- Show separate current-tape and total-job ETAs during tar/ZFS backup and restore,
+  with estimated cartridge counts. Use optional live capacity overrides, read-only
+  native capacity detection, inventory hints, and observed tape lengths; exclude
+  media-change waits from ETA rates. Reuse verification sizes across restore passes.
+- Report cumulative source-wait, commit, and position-query time plus recovery
+  buffer flush counts to help diagnose uneven streaming throughput.
+- Reduce routine durability queries from every 16 MiB to every 64 MiB, retaining
+  the mandatory position check and synchronous fallback at recovery-buffer limits.
+- Automatically rewind and eject full backup cartridges before requesting the
+  next tape, including incremental backups and configured size limits. Keep the
+  backup active with its buffered data if automatic eject fails, allowing a retry
+  at the tape prompt. The final cartridge stays loaded.
+
 ## 2.2.0 — 2026-09-24
 
 - Record cartridge IDs and readable labels as optional volume-header metadata.

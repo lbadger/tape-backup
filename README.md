@@ -13,29 +13,31 @@ snapshot identity. No cartridge
 MAM storage or persistent local manifest is required.
 
 File backups and restores print file names. Streaming operations report transfer
-totals, current and average MiB/s, elapsed time, and an approximate ETA. Backups
+totals, current and average MiB/s, elapsed time, and approximate archive, tape,
+and total-job ETAs. Backups
 and restores also show an overall progress bar in terminals.
 `/dev/nst0` is the default; use `--device`
 to select another non-rewinding tape drive.
 
 ## Current executable
 
-Version **2.2.0** adds persistent cartridge labels, an optional rebuildable
-inventory, restore-chain planning/discovery, and non-writing backup previews.
-It includes ancestor protection during prompted wipes, prompt ejection, accurate
-verification progress, native ZFS streaming,
-file/folder exclusions, shared restore locking, and readable drive diagnostics.
+Version **2.3.0** adds estimated tape counts and separate tape/job ETAs for backup
+and restore, automatic rewind/eject at backup tape changes, and streaming wait
+diagnostics. Routine durability queries are less frequent while recovery-buffer
+checks remain in place. It also includes cartridge labels, optional inventories,
+restore-chain planning, backup previews, native ZFS streaming, exclusions, and
+ancestor protection during prompted wipes.
 Existing format-3 tar backups
 remain readable. Update both machines when using SSH; transport version 3 prevents
 older helpers from silently ignoring exclusion or ZFS options.
 
 Download the executable and checksum from the
-[v2.2.0 release](https://github.com/lbadger/tape-backup/releases/tag/v2.2.0), or
+[v2.3.0 release](https://github.com/lbadger/tape-backup/releases/tag/v2.3.0), or
 build from the current source checkout using Docker:
 
 ```bash
 ./build.sh
-./dist/tape-backup --version  # tape-backup 2.2.0
+./dist/tape-backup --version  # tape-backup 2.3.0
 (cd dist && sha256sum --check tape-backup.sha256)
 ```
 
@@ -102,7 +104,7 @@ flowchart TD
     D --> E[Background reader fills a bounded queue]
     E --> F[Writer continuously drains queue to tape]
     F --> G{End of medium?}
-    G -->|Yes| H[Request fresh cartridge and replay unconfirmed frames]
+    G -->|Yes| H[Rewind and eject; request fresh cartridge and replay unconfirmed frames]
     H --> F
     G -->|No, archive finished| I[Write snapshot and completion marker; commit archive]
     I --> J[Write and commit metadata file: catalog and snapshot copy]
@@ -143,8 +145,8 @@ the metadata file for faster lookup; tape positioning still takes time.
 Append requires the base to be the last completed backup on that cartridge.
 The source directory and any SSH host/account must match. An incomplete or
 unrecognized tail is refused. Existing backup records are retained. During
-streaming, running out of space prompts for a blank cartridge and continues the same
-incremental on the next numbered volume. The application never ejects the tape.
+streaming, running out of space automatically rewinds and ejects the current tape,
+prompts for a blank cartridge, and continues the same incremental on the next numbered volume.
 If there is no room even for the initial header, the command stops. It never
 rewinds the base for an overwrite or skips a numbered volume after a header error.
 
@@ -502,12 +504,16 @@ at completion. Terminals show a block sized to the available width, for example:
 
 ```text
 Backup 726246ca4cb4 | writing volume 1, chunk 382644
-  Total [###############################-] ~99.9% (backup, estimated)
+  Total [################----------------] ~50.0% (backup, estimated)
   Read 1,495.66 GiB  |  Delivered 1,494.70 GiB  |  Committed 1,494.25 GiB
   Buffer 1.00 GiB each  |  Queued 989.10 MiB  |  Recovery 479.40 MiB
   Source 176.0 MiB/s (reading)
+  Wait totals: source 2.1s | flush 1.3s (0 recovery-buffer flushes) | position 0.7s
   I/O 188.5 MiB/s  |  Average 162.4 MiB/s  |  Elapsed 02:39:30
-  ETA ~00:00:06 (current archive)
+  ETA ~02:39:00 (current archive)
+  Total job ETA ~02:39:00
+  Tape 1 of ~2 | 1,518.05 GiB / ~2,328.31 GiB (native capacity)
+    | Tape ETA ~01:26:00
 ```
 
 The progress heading abbreviates the ID; the startup message and successful
@@ -560,14 +566,67 @@ confirmed on tape by READ POSITION or a synchronous filemark flush. Replay does
 not double-count either logical counter. Restore delivery counts archive bytes
 passed to GNU tar. The average includes elapsed media-change time.
 
-The ETA estimates remaining time for the **current archive**, not later
-incrementals in a restore chain. Backup estimates come from file metadata only;
-restore uses that estimate from the tape header, or exact archive sizes after
-verification. Sparse files, incremental
-selection, directory changes, media changes, and final flushing can affect its
-accuracy. It starts as `calculating` and shows `finishing (estimate reached)` when
-an underestimated archive is still running. No source contents are read merely
-to calculate the estimate.
+The **current archive ETA** covers the backup currently being written or restored.
+The **total job ETA** includes all selected archives and any verification pass.
+For a restore chain, existing inventory entries supply sizes without extra tape
+scans; verification supplies exact sizes as it finishes. If later archive sizes
+are unavailable, total job ETA says `calculating (remaining archive sizes unknown)`
+while the current archive and tape estimates remain available. Load, rewind,
+eject, and tape-change waits are excluded from ETA throughput calculations; elapsed
+time and average I/O rate still include them. Future operator delays are unknown.
+
+**Tape N of ~M** estimates the number of cartridges for the current backup archive,
+including its current tape. **Tape ETA** estimates time until that tape's remaining
+archive data is transferred, capped at the archive's remaining estimated size for
+a partially filled final tape. A restore chain also shows **Job tapes**, deduplicating
+known shared cartridges; unidentified cartridges may still overlap, so estimates
+can be high. Verification rereads reuse the same cartridges, not a second set.
+
+Capacity comes from `--volume-size` when testing a backup, an optional
+`--cartridge-capacity`, a previously observed full cartridge, or the drive's native
+capacity when supported. Detection reads capacity attributes once when opening
+a volume; it sends no movement commands or periodic capacity queries during writing.
+Unsupported or unavailable capacity stays unknown until a full tape is observed,
+or you supply an estimate. The detected native capacities assume no compression;
+the first full cartridge improves the estimate for later cartridges. Appending
+accounts for existing recorded bytes and, when available, remaining native capacity.
+Compression, framing, replay, varying cartridges, and metadata affect accuracy.
+Restore also reuses the measured volume lengths from its verification pass.
+
+Supply usable **host-data capacity** for a better initial estimate if needed:
+
+```bash
+./tape-backup backup --source /opt/books --cartridge-capacity 2300GiB
+./tape-backup restore --backup FULL_ID --destination /srv/books \
+  --cartridge-capacity 2300GiB
+```
+
+This option is advisory: it does not force a tape change or limit writes.
+`zfs-backup` and `zfs-restore` accept it too. Estimates start as `calculating` and
+show `finishing (estimate reached)` if the estimate is exhausted before completion.
+Source estimates use metadata only; source contents are not read just to estimate.
+Sparse files, incremental selection, directory changes, and final flushing can
+affect accuracy. Completion still requires all checks and finalization to succeed.
+
+For uneven write speeds, compare the queue and the cumulative **Wait totals**:
+
+- A drained queue and rising `source` wait indicate that tar, source storage, SSH,
+  or source-side work is not supplying data fast enough.
+- Rising `flush` time and `recovery-buffer flushes` indicate time spent committing
+  data because the recovery window filled. Flush time also includes required
+  header, completion, and catalog commits.
+- Rising `position` time measures the cost of durability queries between writes.
+  Routine queries occur every 64 MiB of records, with another check whenever the
+  recovery window is about to fill.
+- A full queue with little source/flush/query waiting points to write calls,
+  hashing, or the drive/transport, rather than insufficient read-ahead.
+
+At 160 MiB/s, a filled 1 GiB source buffer can bridge about 6 seconds without new
+input; 4 GiB can bridge about 26 seconds. `--buffer-size 4GiB` can help a bursty
+source, but allocates up to 4 GiB each for read-ahead and recovery, plus overhead.
+It cannot improve a sustained source deficit or a drive-limited transfer when the
+queue is already full. `--quiet` removes per-file log traffic while keeping these
+diagnostics. The counters diagnose pauses; no throughput increase is guaranteed.
 
 `--quiet` suppresses per-file output while retaining rates, ETA, summaries, and
 errors. Large-file transfers still produce periodic status lines.
@@ -780,7 +839,8 @@ lock. Native ZFS uses `zfs send` in estimate-only mode and validates snapshot GU
 
 The preview does **not** check blank media, remaining physical capacity, or the
 final append position. It is not an exact changed-file list. Actual backups repeat
-source and tape validation. `--cartridge-capacity` is a preview-only estimate input,
+source and tape validation. `--cartridge-capacity` supplies an advisory capacity for
+both previews and live tape-count/ETA estimates,
 not a write limit; the hidden `--volume-size` remains the testing write limit.
 The cartridge estimate assumes empty cartridges and no hardware compression.
 Framing, recovery, metadata, and existing contents change the actual count.
@@ -915,8 +975,11 @@ For ID discovery, the ID argument is `unknown-backup`. Plain `inspect` and `insp
 volume number. Update existing loaders to support these requests.
 The command runs without a shell; prompts otherwise
 use `/dev/tty`. The application closes the tape device before requesting another
-cartridge but leaves the current cartridge loaded. The loader must handle any
-unloading needed to change tapes.
+cartridge. During backup, it also rewinds and ejects a full tape before invoking
+the loader for the next cartridge, including at a configured size limit. If eject
+fails, it logs the error and still invokes the loader. The loader must handle any
+remaining unloading needed to change tapes, including read requests and retries
+after a recorded continuation cartridge is refused.
 
 ## Initialize a tape for reuse
 
@@ -1038,8 +1101,14 @@ or power cycles; the command does not change persistent driver defaults.
 
 ## Eject a tape
 
-Tapes stay loaded after backup, restore, list, inspect, and verify, and at tape-change
-prompts. The application never ejects automatically. When finished, eject explicitly:
+During a multi-tape backup, each full tape is automatically rewound and ejected
+before the next cartridge is requested. This also applies to incremental backups
+and configured cartridge size limits. Buffered data and the drive lock are retained.
+If automatic eject fails, the backup reports the error and continues to the load
+prompt, where you can type `eject` to retry or replace the cartridge manually.
+
+The final tape stays loaded after backup. Tapes also stay loaded after restore,
+list, inspect, and verify, and at their tape-change prompts. When finished, eject explicitly:
 
 ```bash
 ./tape-backup eject --device /dev/nst0

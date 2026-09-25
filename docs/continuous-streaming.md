@@ -53,7 +53,7 @@ They may drain kernel pending writes but do not request a drive-buffer flush.
 The implementation does not infer durability from successful write calls, the
 host-side MTIOCPOS position, or estimated buffer byte counts.
 
-Queries occur after approximately 16 MiB of records and before exhausting
+Queries occur after approximately 64 MiB of records and before exhausting
 recovery space. Frames whose final record precedes the next-unwritten position
 are released. If space remains insufficient, a synchronous filemark commits the
 window. There are also synchronous commits for each volume header, planned volume
@@ -61,6 +61,14 @@ end, and backup completion. A final commit happens even if telemetry already
 confirmed the completion frame. This is continuous streaming when telemetry is
 usable and the recovery window is sufficient; no universal zero-pause guarantee
 is made for source speed, drive mechanics, unsupported telemetry, or tape changes.
+
+Progress reports cumulative source-wait, commit, and position-query time, including
+an operation currently in progress. The recovery-buffer flush count separates
+buffer-pressure commits from normal header, completion, and catalog commits.
+Compare these with queue occupancy during slow intervals before changing buffer
+sizes or query policy. A full source queue does not benefit from more read-ahead.
+Capacity detection for tape-count and tape-ETA estimates occurs only when opening
+a volume, before streaming writes; it adds no queries to the steady write loop.
 
 On an error, retain the entire uncertain suffix and write it again on a replacement
 tape. Every frame's old physical position is cleared before replay. The replacement
@@ -115,3 +123,5 @@ backhitch behavior cannot be established by simulated media tests.
   separate host/medium object locations and position validity flags.
 - [Linux SG_IO interface](https://github.com/torvalds/linux/blob/v6.1/include/scsi/sg.h)
   and [st ioctl implementation](https://github.com/torvalds/linux/blob/v6.1/drivers/scsi/st.c).
+- [IBM LTO SCSI Reference](https://www.ibm.com/support/pages/system/files/inline-files/%5BAPPROVED%5D%20LTO%20SCSI%20Reference%20GA32-0928-07%20%28EXTERNAL%29.pdf),
+  sections 5.2.16 and 5.5.2.2.1: read-only MAM capacity attributes and native MiB units.

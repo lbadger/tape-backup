@@ -544,7 +544,7 @@ class StreamingTests(unittest.TestCase):
             self.create()
         self.assertFalse(list(self.media.directory.glob('*.tape')))
 
-    def test_backup_inspect_verify_incremental_and_restore_never_eject(self):
+    def test_file_media_backup_inspect_verify_incremental_and_restore_never_eject(self):
         self.seed()
         self.media.eject = Mock(side_effect=AssertionError('Automatic ejection'))
         self.media.release = Mock(side_effect=AssertionError('Automatic media release'))

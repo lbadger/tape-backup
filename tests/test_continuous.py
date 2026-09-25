@@ -263,6 +263,25 @@ class ContinuousTests(unittest.TestCase):
 
 
 class PositionTests(unittest.TestCase):
+    def test_routine_polling_is_less_frequent_and_buffer_pressure_still_checks(self):
+        job = {'id': 'a' * 32, 'level': 'full', 'parent': None}
+        for budget, expected_queries in ((128 * 1024**2, 1), (16 * 1024**2, 5)):
+            with self.subTest(budget=budget):
+                progress = tb.Progress('test')
+                writer = tb.StreamWriter(Mock(), job, None, progress, budget)
+                volume = writer.volume = Mock(objects=0)
+                def write(record):
+                    volume.objects += 1
+                volume.write.side_effect = write
+                volume.durable_position.side_effect = lambda: volume.objects
+                payload = b'a' * (4 * 1024**2)
+                for _ in range(16):
+                    writer.send('data', payload)
+                    self.assertLessEqual(writer.pending_bytes, budget)
+                self.assertEqual(volume.durable_position.call_count, expected_queries)
+                volume.commit.assert_not_called()
+                self.assertEqual(progress.written_bytes, 64 * 1024**2)
+
     def ioctl(self, first=20, last=10, flags=0, resid=0, sense=None):
         def invoke(fd, operation, raw, mutate):
             self.assertEqual((fd, operation, mutate), (42, 0x2285, True))

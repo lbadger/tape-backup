@@ -59,6 +59,9 @@ class TapeVolume(tb.Volume):
     def position(self):
         return self.stream.tape.cursor
 
+    def capacity(self):
+        return None
+
     def start_appending(self):
         self.objects = self.durable_objects = self.position()
 
@@ -147,7 +150,10 @@ class TapeMedia(tb.TapeMedia):
     def mt(self, *args):
         if args == ('rewind',):
             self.active.cursor = 0
-        elif args != ('setblk', '0'):
+        elif args == ('offline',):
+            self.active.cursor = 0
+            self.active = None
+        elif args not in (('setblk', '0'), ('unlock',)):
             raise AssertionError('Unexpected tape operation: ' + repr(args))
 
     def raw_open(self, writing):
@@ -206,6 +212,7 @@ class AppendTests(unittest.TestCase):
 
     def test_physical_cartridge_two_appends_and_restore_without_reload(self):
         media = TapeMedia()
+        media.eject = Mock(wraps=media.eject)
         full = self.backup(media)
         original = list(media.tapes[0].records)
         (self.source / 'new').write_text('first incremental')
@@ -218,6 +225,7 @@ class AppendTests(unittest.TestCase):
         media.requests.clear()
         self.restore(media, [full, one, two], tree_contents(self.source))
         self.assertEqual(media.requests, [(full, 1, 'read')])
+        media.eject.assert_not_called()
 
     def test_incremental_without_append_option_preserves_full_and_prior_deltas(self):
         media = TapeMedia()
@@ -256,9 +264,10 @@ class AppendTests(unittest.TestCase):
             tb.restore([backup_id], destination, media, quiet=True)
             self.assertEqual(tree_contents(destination), expected)
 
-    def test_incremental_rollover_rejects_the_still_loaded_base_cartridge(self):
+    def test_incremental_rollover_rejects_the_reinserted_base_cartridge(self):
         media = TapeMedia()
         full = self.backup(media)
+        first = media.active
         original = list(media.active.records)
         media.active.capacity = sum(r is not None for r in original) + 5
         (self.source / 'new').write_bytes(os.urandom(200_000))
@@ -268,6 +277,7 @@ class AppendTests(unittest.TestCase):
             nonlocal attempts
             if action == 'blank':
                 attempts += 1
+                media.active = first
                 if attempts == 2:
                     raise tb.BackupError('Media change cancelled')
             if action not in ('write', 'blank'):
@@ -327,10 +337,12 @@ class AppendTests(unittest.TestCase):
     def test_rollover_during_append_preserves_full_and_restores_chain(self):
         media = TapeMedia(capacity=30)
         full = self.backup(media)
+        media.eject = Mock(wraps=media.eject)
         original = list(media.tapes[0].records)
         (self.source / 'new').write_bytes(os.urandom(2_000_000))
         delta = self.backup(media, full)
         self.assertGreater(len(media.tapes), 1)
+        self.assertEqual(media.eject.call_count, len(media.tapes) - 1)
         self.assertEqual(media.tapes[0].records[:len(original)], original)
         media.loaded = False
         self.restore(media, [full, delta], tree_contents(self.source))
@@ -350,10 +362,14 @@ class AppendTests(unittest.TestCase):
 
     def test_test_capacity_forces_physical_tape_changes_before_actual_eom(self):
         media = TapeMedia()  # No physical capacity limit or injected EOM errors.
+        media.eject = Mock(wraps=media.eject)
         (self.source / 'book').write_bytes(os.urandom(2_000_000))
         limit = 512 * 1024
         full = self.backup(media, volume_size=limit)
         self.assertGreaterEqual(len(media.tapes), 3)
+        self.assertEqual(media.eject.call_count, len(media.tapes) - 1)
+        self.assertIs(media.active, media.tapes[-1])
+        self.assertTrue(media.loaded)
         for number, tape in enumerate(media.tapes, 1):
             self.assertLessEqual(sum(len(r) for r in tape.records if r is not None), limit)
             header = tb.decoded_header(tape.records[0])
@@ -731,6 +747,7 @@ class AppendTests(unittest.TestCase):
     def test_incremental_size_cap_rollover_cannot_overwrite_the_base(self):
         media = TapeMedia()
         full = self.backup(media)
+        first = media.active
         before = list(media.active.records)
         request = media.request
         attempts = 0
@@ -738,6 +755,7 @@ class AppendTests(unittest.TestCase):
             nonlocal attempts
             if action == 'blank':
                 attempts += 1
+                media.active = first
                 if attempts == 2:
                     raise tb.BackupError('Media change cancelled')
             if action not in ('write', 'blank'):
@@ -769,14 +787,16 @@ class AppendTests(unittest.TestCase):
                 attempts += 1
                 requests.append((backup_id, number, action))
                 if attempts == 1:
+                    self.assertIsNone(media.active)
+                    media.active = media.tapes[0]
                     first_records = list(media.active.records)
-                    return  # Volume 1 is still in the drive.
+                    return  # The ejected first volume was inserted again.
                 if attempts == 2:
                     media.active = used
                     return  # A different used tape is inserted.
             request(backup_id, number, action)
         media.request, media.raw_open = load_wrong_then_blank, track_open
-        media.eject = Mock(side_effect=AssertionError('Automatic ejection'))
+        media.eject = Mock(wraps=media.eject)
         with patch.object(tb, 'start_archive', wraps=tb.start_archive) as source:
             full = self.backup(media)
         self.assertEqual(source.call_count, 1)
@@ -788,11 +808,12 @@ class AppendTests(unittest.TestCase):
         media.loaded = False
         self.assertTrue(tb.scan(media, full)['data_verified'])
         self.restore(media, [full], tree_contents(self.source))
-        media.eject.assert_not_called()
+        self.assertEqual(media.eject.call_count, len(media.tapes) - 1)
 
     def test_incremental_can_retry_blank_first_volume_after_size_cap(self):
         media = TapeMedia()
         full = self.backup(media)
+        media.eject = Mock(wraps=media.eject)
         first = media.active
         before = list(first.records)
         (self.source / 'new').write_text('delta')
@@ -802,6 +823,9 @@ class AppendTests(unittest.TestCase):
             if action == 'blank' and number == 1:
                 requests.append((backup_id, number, action))
                 if len(requests) == 1:
+                    self.assertIsNone(media.active)
+                    self.assertEqual(media.eject.call_count, 1)
+                    media.active = first
                     return
             request(backup_id, number, action)
         media.request = leave_base_once

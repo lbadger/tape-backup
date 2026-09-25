@@ -12,6 +12,7 @@ import fcntl
 import hashlib
 import json
 import locale
+import math
 import os
 from pathlib import Path
 import re
@@ -32,11 +33,13 @@ BLOCK_SIZE = 64 * 1024
 DEFAULT_BUFFER = 1024**3
 MAX_BUFFER = 10 * 1024**3
 FRAME_SIZE = 4 * 1024**2
-POSITION_INTERVAL = 16 * 1024**2
+# Poll less often during steady streaming; send() always checks again before
+# exhausting the bounded recovery window, regardless of this interval.
+POSITION_INTERVAL = 64 * 1024**2
 MAGIC = b"TAPE-STREAM-3\n"
 ZFS_MAGIC = b"TAPE-STREAM-4\n"
 ZERO_CHAIN = "0" * 64
-PROGRAM_VERSION = "2.2.0"
+PROGRAM_VERSION = "2.3.0"
 # Linux struct mtop: short operation, padding, int count (x86-64 / AArch64).
 MTIOCTOP = 0x40086D01
 MTWEOF = 5
@@ -374,24 +377,226 @@ class Progress:
         self.eta_started = self.started
         self.archives, self.passes = archives, passes
         self.overall = None
+        self.archive_sizes = {}
+        self.exact_sizes = set()
+        self.archive_tapes = {}
+        self.archive_cartridges = {}
+        self.tape_spans = {}
+        self.observed_capacity = {}
+        self.cartridge_capacity = None
+        self.tape = None
+        self.media_wait = False
+        self.job_eta_started = self.started
+        self.job_done = 0
+        self.wait_seconds = {'source': 0.0, 'flush': 0.0, 'position': 0.0}
+        self.wait_started = {}
+        self.recovery_flushes = 0
+
+    @contextmanager
+    def timing(self, operation):
+        started = time.monotonic()
+        self.wait_started[operation] = started
+        try:
+            yield
+        finally:
+            self.wait_seconds[operation] += time.monotonic() - started
+            self.wait_started.pop(operation, None)
+
+    def streaming_waits(self, now):
+        def elapsed(operation):
+            return self.wait_seconds[operation] + max(0, now - self.wait_started.get(operation, now))
+        return (f'Wait totals: source {elapsed("source"):.1f}s | flush {elapsed("flush"):.1f}s '
+                f'({self.recovery_flushes} recovery-buffer flushes) | position {elapsed("position"):.1f}s')
+
+    def seed_archives(self, backup_ids, media):
+        """Use available inventory hints without loading or scanning extra tapes."""
+        entries = getattr(media, 'inventory_entries', [])
+        for index, backup_id in enumerate(backup_ids):
+            for entry in entries:
+                if entry['id'] != backup_id:
+                    continue
+                size = entry.get('data_bytes', entry.get('estimated_bytes'))
+                count = entry.get('expected_volumes') or entry.get('volumes')
+                if type(size) is int and size > 0 and (index not in self.exact_sizes or 'data_bytes' in entry):
+                    self.archive_sizes[index] = size
+                    if entry.get('data_bytes') == size:
+                        self.exact_sizes.add(index)
+                if type(count) is int and count > 0:
+                    self.archive_tapes[index] = count
+                if entry.get('cartridge_id') and type(entry.get('volume')) is int:
+                    self.archive_cartridges.setdefault(index, {})[entry['volume']] = entry['cartridge_id']
+
+    @contextmanager
+    def changing_media(self):
+        started, previous = time.monotonic(), self.tape
+        self.media_wait = True
+        try:
+            yield
+        finally:
+            now = time.monotonic()
+            self.eta_started += now - started
+            self.job_eta_started += now - started
+            if self.tape is not None and self.tape is not previous:
+                self.tape['started'] = now
+            self.media_wait = False
+
+    def start_tape(self, volume, number, *, writing=False, capacity=None, frame_size=FRAME_SIZE,
+                   cartridge_id=None):
+        if self.archives is None:
+            return
+        archive = self.overall['archive'] if self.overall else 0
+        if cartridge_id:
+            self.archive_cartridges.setdefault(archive, {})[number] = cartridge_id
+        capacity = capacity or self.cartridge_capacity
+        basis = 'configured capacity' if capacity else 'observed capacity'
+        capacity = capacity or self.observed_capacity.get(archive)
+        if not capacity:
+            detected = volume.capacity()
+            if detected:
+                capacity, remaining = detected
+                basis = 'native capacity'
+                if writing and volume.record_bytes and remaining < capacity:
+                    # Extrapolate remaining space using this append cartridge's
+                    # existing host bytes per native byte, including compression.
+                    capacity = volume.record_bytes * capacity / (capacity - remaining)
+                    basis = 'estimated append capacity'
+        self.tape = {'volume': volume, 'number': number, 'archive': archive,
+                     'capacity': capacity, 'basis': basis, 'writing': writing,
+                     'start_used': volume.record_bytes, 'started': time.monotonic(),
+                     'payload_start': self.overall['done'] if self.overall else 0,
+                     'overhead': 1 + BLOCK_SIZE / frame_size, 'finished': False}
+
+    def end_tape(self, *, full=False):
+        if self.tape is None:
+            return
+        tape = self.tape
+        used = tape['volume'].record_bytes
+        if not tape['writing']:
+            self.tape_spans[tape['archive'], tape['number']] = used
+        if full and used > 2 * BLOCK_SIZE:
+            # Learn only from an actual boundary, not an arbitrary write error.
+            self.observed_capacity[tape['archive']] = used
+        tape['finished'] = True
+
+    def tape_progress(self, now):
+        if self.tape is None:
+            return None
+        tape = self.tape
+        used = tape['volume'].record_bytes
+        capacity = tape['capacity']
+        done = self.overall['done'] if self.overall else 0
+        payload = max(0, done - tape['payload_start'])
+        transferred = max(0, used - tape['start_used'])
+        overhead = max(1, transferred / payload) if payload else tape['overhead']
+        remaining = max(0, self.total_bytes - done) * overhead if self.total_bytes else None
+        count = self.archive_tapes.get(tape['archive'])
+        if count is not None:
+            count_text = str(max(tape['number'], count))
+        elif capacity and remaining is not None:
+            # Every future cartridge needs its own volume header.
+            extra = max(0, remaining - max(0, capacity - used))
+            count_text = '~' + str(tape['number'] + math.ceil(extra / max(BLOCK_SIZE, capacity - BLOCK_SIZE)))
+        else:
+            count_text = '?'
+        description = f'Tape {tape["number"]} of {count_text}'
+        if self.archives and self.archives > 1:
+            description += f' (archive {tape["archive"] + 1}/{self.archives})'
+        if capacity:
+            description += f' | {readable_size(used, "GiB")} / ~{readable_size(capacity, "GiB")} ({tape["basis"]})'
+        else:
+            description += ' | capacity unknown'
+        target = self.tape_spans.get((tape['archive'], tape['number'])) if not tape['writing'] else None
+        if target is None:
+            target = capacity
+        left = max(0, target - used) if target else None
+        if left is None and self.archive_tapes.get(tape['archive']) == tape['number']:
+            left = remaining  # A known final volume ends with the archive.
+        if remaining is not None and left is not None:
+            left = min(left, remaining)
+        if self.phase == 'complete':
+            eta = '00:00:00'
+        elif self.media_wait:
+            eta = 'waiting for media'
+        elif tape['finished']:
+            eta = '00:00:00'
+        elif left is None or not transferred:
+            eta = 'calculating'
+        elif not left:
+            eta = 'finishing (estimate reached)'
+        else:
+            eta = '~' + readable_duration(left * max(0, now - tape['started']) / transferred)
+        result = description + f' | Tape ETA {eta}'
+        if self.archives and self.archives > 1:
+            known, missing, estimated = set(), 0, False
+            for archive in range(self.archives):
+                count = self.archive_tapes.get(archive)
+                if archive == tape['archive']:
+                    count = int(count_text.lstrip('~')) if count_text != '?' else None
+                    estimated |= count_text.startswith('~')
+                elif count is None and capacity and self.archive_sizes.get(archive):
+                    count = math.ceil(self.archive_sizes[archive] * overhead / max(BLOCK_SIZE, capacity - BLOCK_SIZE))
+                    estimated = True
+                if count is None:
+                    return result + ' | Job tapes calculating'
+                cartridges = self.archive_cartridges.get(archive, {})
+                known.update(tuple(cartridges.values()))
+                missing += max(0, count - len(cartridges))
+            result += f' | Job tapes {"~" if estimated or missing else ""}{len(known) + missing}'
+        return result
+
+    def job_eta(self, now, archive_eta):
+        if self.phase == 'complete':
+            return '00:00:00'
+        if self.media_wait:
+            return 'waiting for media'
+        if self.archives is None or self.overall is None:
+            return archive_eta
+        state = self.overall
+        if any(index not in self.archive_sizes for index in range(self.archives)):
+            return 'calculating (remaining archive sizes unknown)'
+        sizes = [self.archive_sizes[index] for index in range(self.archives)]
+        remaining = (sum(sizes) * (self.passes - state['pass'] - 1) +
+                     sum(sizes[state['archive'] + 1:]) +
+                     (0 if state['finished'] else max(0, sizes[state['archive']] - state['done'])))
+        if not remaining:
+            return 'finalizing' if state['finished'] or archive_eta == 'finalizing' else 'finishing (estimate reached)'
+        if not self.job_done:
+            return 'calculating'
+        return '~' + readable_duration(remaining * max(0, now - self.job_eta_started) / self.job_done)
 
     def estimate(self, total):
         self.total_bytes = total if type(total) is int and total > 0 else None
+        if self.overall is not None:
+            index = self.overall['archive']
+            if index in self.exact_sizes or self.total_bytes is None:
+                self.total_bytes = self.archive_sizes.get(index)
+            if self.total_bytes:
+                self.archive_sizes[index] = self.total_bytes
         self.eta_base = self.written_bytes
         self.eta_started = time.monotonic()
 
     def track_archive(self, total, *, archive=0, pass_number=0, stage='backup', sizes=None):
-        self.estimate(total)
+        if sizes:
+            self.archive_sizes.update(enumerate(sizes))
+            self.exact_sizes.update(range(len(sizes)))
+        self.tape = None
         self.overall = {'done': 0, 'archive': archive, 'pass': pass_number,
                         'stage': stage, 'sizes': sizes, 'finished': False}
+        self.estimate(total)
 
     def advance(self, count):
         if self.overall is not None:
             self.overall['done'] += count
+            self.job_done += count
 
     def finish_archive(self):
         if self.overall is not None:
             self.overall['finished'] = True
+            self.archive_sizes[self.overall['archive']] = self.overall['done']
+            self.exact_sizes.add(self.overall['archive'])
+            if self.tape is not None:
+                self.archive_tapes[self.overall['archive']] = self.tape['number']
+                self.end_tape()
 
     def total_progress(self, width=None):
         state = self.overall
@@ -464,6 +669,8 @@ class Progress:
         else:
             seconds = int((self.total_bytes - done) * (now - self.eta_started) / done)
             eta = f"~{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
+        job_eta = self.job_eta(now, eta)
+        tape = self.tape_progress(now)
         if sys.stderr.isatty():
             label = f'Backup {self.label[:12]}' if re.fullmatch('[0-9a-f]{32}', self.label) else self.label
             width = terminal_width(sys.stderr)
@@ -477,9 +684,15 @@ class Progress:
                             f'Queued {readable_size(self.queued_bytes)}  |  Recovery {readable_size(self.retry_bytes)}')
             if self.reader_state is not None:
                 rows.append(f'Source {read_rate:.1f} MiB/s ({self.reader_state})')
+            if self.buffer_size is not None:
+                rows.append(self.streaming_waits(now))
             rows.append(f'I/O {rate:.1f} MiB/s  |  Average {average:.1f} MiB/s  |  '
                         f'Elapsed {readable_duration(now - self.started)}')
             rows.append(f'ETA {eta} (current archive)')
+            if self.archives is not None:
+                rows.append(f'Total job ETA {job_eta}')
+            if tape:
+                rows.append(tape)
             lines = []
             for index, row in enumerate(rows):
                 lines.extend(textwrap.wrap(display_text(row), width=width,
@@ -501,7 +714,10 @@ class Progress:
             f"{buffer}{reader}"
             f"{rate:.1f} MiB/s I/O, {average:.1f} MiB/s average; "
             f"ETA {eta} (current archive); {now - self.started:.0f}s elapsed"
-            f"{'; ' + total if total else ''}")
+            f"{'; ' + total if total else ''}"
+            f"{'; Total job ETA ' + job_eta if self.archives is not None else ''}"
+            f"{'; ' + tape if tape else ''}"
+            f"{'; ' + self.streaming_waits(now) if self.buffer_size is not None else ''}")
         self.last_time, self.last_bytes = now, transferred
         self.last_read_bytes = read_bytes
 
@@ -568,6 +784,44 @@ def tape_position(fd):
     if last > first:
         return None
     return first, last
+
+
+def tape_capacity(fd):
+    """Best-effort MAM native (maximum, remaining) bytes; never moves the tape.
+
+    READ ATTRIBUTE 8Ch, attributes 0000h/0001h, in MiB (IBM LTO SCSI
+    Reference GA32-0928-07, sections 5.2.16 and 5.5.2.2.1).
+    Query only when opening a volume, before any streaming writes.
+    """
+    cdb = bytearray(16)
+    cdb[0] = 0x8c
+    cdb[10:14] = (30).to_bytes(4, 'big')
+    command = ctypes.create_string_buffer(bytes(cdb), 16)
+    data, sense = ctypes.create_string_buffer(30), ctypes.create_string_buffer(64)
+    header = SgIoHeader(interface_id=ord('S'), dxfer_direction=-3,
+                        cmd_len=16, mx_sb_len=64, dxfer_len=30,
+                        dxferp=ctypes.addressof(data), cmdp=ctypes.addressof(command),
+                        sbp=ctypes.addressof(sense), timeout=10000)
+    raw = bytearray(bytes(header))
+    try:
+        fcntl.ioctl(fd, 0x2285, raw, True)
+    except OSError:
+        return None
+    header = SgIoHeader.from_buffer_copy(raw)
+    if header.status or header.host_status or header.driver_status or header.resid:
+        return None
+    if int.from_bytes(data.raw[:4], 'big') < 26:
+        return None
+    values = []
+    for identifier, offset in enumerate((4, 17)):
+        attribute, flags, length = struct.unpack_from('>HBH', data.raw, offset)
+        if attribute != identifier or flags & 3 or length != 8:
+            return None
+        values.append(int.from_bytes(data.raw[offset + 5:offset + 13], 'big'))
+    remaining, maximum = values
+    if not 0 <= remaining <= maximum < 2**64 - 1 or not maximum:
+        return None
+    return maximum * 1024**2, remaining * 1024**2
 
 
 def compression_status(fd):
@@ -752,6 +1006,9 @@ class Volume:
         self.prefetched = None
         self.first_header_sha256 = None
 
+    def capacity(self):
+        return tape_capacity(self.stream.fileno()) if self.physical else None
+
     def control(self, operation, count=1):
         fcntl.ioctl(self.stream.fileno(), MTIOCTOP, struct.pack("@hi", operation, count))
 
@@ -849,12 +1106,13 @@ class Volume:
         self.record_bytes += count
 
     def commit(self):
-        if self.physical:
-            # MTWEOF, unlike MTWEOFI, waits for buffered data to reach the tape.
-            self.control(MTWEOF)
-            self.objects += 1
-        else:
-            os.fsync(self.stream.fileno())
+        with self.progress.timing('flush') if self.progress else nullcontext():
+            if self.physical:
+                # MTWEOF, unlike MTWEOFI, waits for buffered data to reach the tape.
+                self.control(MTWEOF)
+                self.objects += 1
+            else:
+                os.fsync(self.stream.fileno())
         self.durable_objects = self.objects
 
     def durable_position(self):
@@ -1596,8 +1854,26 @@ class StreamWriter:
             target = getattr(self.media, 'device', None) or getattr(self.media, 'path', 'media')
             raise OSError(exc.errno, f'{phase} on {target}: {exc.strerror or exc}') from exc
 
-    def next_volume(self):
+    def eject_for_change(self):
+        self.progress.phase = 'rewinding and ejecting tape'
+        log('Rewinding and ejecting tape before loading the next cartridge')
+        try:
+            self.media.eject()
+        except (BackupError, OSError) as exc:
+            log(f'Automatic eject failed: {display_text(exc)}. '
+                'Backup remains active; buffered data is retained. '
+                'Replace the cartridge or retry with eject at the tape prompt.')
+
+    def next_volume(self, *, full=False):
+        self.progress.end_tape(full=full)
+        with self.progress.changing_media():
+            self._next_volume()
+
+    def _next_volume(self):
+        physical = self.volume is not None and self.volume.physical
         self.close(ignore_errors=True)
+        if physical:
+            self.eject_for_change()
         self.number += 1
         self.committed_frames = 0
         self.progress.phase = f"load volume {self.number}"
@@ -1610,6 +1886,8 @@ class StreamWriter:
         if prepared is not None and self.volume_size and prepared.record_bytes + 4 * BLOCK_SIZE > self.volume_size:
             log('No room for a new backup segment under the cartridge size limit; load fresh media')
             prepared.close()
+            if prepared.physical:
+                self.eject_for_change()
             prepared = None
         if prepared is not None:
             self.volume = prepared
@@ -1657,6 +1935,9 @@ class StreamWriter:
             # A successful fresh-media load rewinds (or creates an empty file).
             # No position query is needed before the first record is written.
             position = 0
+        self.progress.start_tape(self.volume, self.number, writing=True, capacity=self.volume_size,
+                                 frame_size=min(FRAME_SIZE, max(BLOCK_SIZE, self.replay_limit - BLOCK_SIZE)),
+                                 cartridge_id=identity['id'])
         self.volume.progress = self.progress
         first = self.pending[0] if self.pending else None
         header = encoded_header({"type": "volume", "format": 4 if self.job.get('archive_type') == 'zfs' else 3,
@@ -1700,7 +1981,8 @@ class StreamWriter:
         self.progress.retry_bytes = self.pending_bytes
 
     def poll_position(self):
-        position = self.volume.durable_position()
+        with self.progress.timing('position'):
+            position = self.volume.durable_position()
         self.since_position = 0
         if position is not None:
             self.retire(position)
@@ -1732,7 +2014,7 @@ class StreamWriter:
             # A failed volume header is not a skippable data tail: readers need
             # every numbered volume's identity and replay boundary. Abort if
             # initialization fails rather than publish an unreadable tape set.
-            self.next_volume()
+            self.next_volume(full=error.errno == errno.ENOSPC)
             try:
                 for frame in self.pending:
                     self.write_frame(frame)
@@ -1741,6 +2023,8 @@ class StreamWriter:
                 error = exc
 
     def flush(self, reason):
+        if reason == 'recovery buffer full':
+            self.progress.recovery_flushes += 1
         while True:
             self.progress.phase = f"flushing volume {self.number} ({reason})"
             try:
@@ -1761,7 +2045,7 @@ class StreamWriter:
             self.next_volume()
         if self.volume_size and self.used + size > self.volume_size:
             self.flush("volume boundary")
-            self.next_volume()
+            self.next_volume(full=True)
         if self.pending_bytes + size > self.replay_limit:
             try:
                 self.poll_position()
@@ -1810,6 +2094,12 @@ class StreamReader:
             volume.close()
 
     def next_volume(self):
+        if self.progress:
+            self.progress.end_tape(full=True)
+        with self.progress.changing_media() if self.progress else nullcontext():
+            self._next_volume()
+
+    def _next_volume(self):
         physical = self.volume is not None and self.volume.physical
         self.close()
         requested_number = self.number + 1
@@ -1876,6 +2166,8 @@ class StreamReader:
             raise BackupError(f"Wrong or incomplete volume {self.number}: {exc}") from exc
         self.job, self.backup_id = job, job["id"]
         self.volume_sequence, self.volume_chain = head["sequence"], head["previous"]
+        if self.progress:
+            self.progress.start_tape(self.volume, self.number, cartridge_id=self.cartridge['id'])
         if hasattr(self.volume, 'catalog_entries'):
             self.media.entries = self.volume.catalog_entries
         elif not self.volume.physical:
@@ -2074,7 +2366,8 @@ class ReadAhead:
             with self.condition:
                 if not self.pending and not self.done:
                     self.progress.phase = "waiting for source"
-                self.condition.wait_for(lambda: self.pending or self.done)
+                    with self.progress.timing('source'):
+                        self.condition.wait_for(lambda: self.pending or self.done)
                 if not self.pending:
                     if self.error is not None:
                         raise self.error
@@ -2521,7 +2814,8 @@ def backup_zfs(snapshot, media, *, base=None, raw=None, volume_size=None,
                                       zfs=metadata['zfs'], ssh=ssh)
             return write_backup(metadata['source'], media, 'incremental' if base else 'full', base,
                                 volume_size, buffer_size, quiet, snapshot_fd, metadata['estimated_bytes'],
-                                remote, frame_size, zfs=metadata['zfs'], parent_job=parent, verify=verify)
+                                remote, frame_size, zfs=metadata['zfs'], parent_job=parent, verify=verify,
+                                cartridge_capacity=cartridge_capacity)
         finally:
             if remote:
                 remote.close()
@@ -2555,7 +2849,7 @@ def check_zfs_base(dataset, metadata):
         raise BackupError('ZFS destination has a newer snapshot; refusing to roll it back')
 
 
-def restore_zfs(backup_ids, dataset, media):
+def restore_zfs(backup_ids, dataset, media, *, cartridge_capacity=None):
     zfs_name(dataset)
     if not backup_ids or len(set(backup_ids)) != len(backup_ids):
         raise BackupError('Specify a ZFS full/incremental chain without duplicate backup IDs')
@@ -2565,6 +2859,8 @@ def restore_zfs(backup_ids, dataset, media):
         valid_id(backup_id)
     with restore_lock(dataset, zfs=True), media.lock(), \
             Progress('ZFS restore', archives=len(backup_ids), passes=2) as progress:
+        progress.cartridge_capacity = cartridge_capacity
+        progress.seed_archives(backup_ids, media)
         exists = zfs_target_exists(dataset)
         previous_id = None
         if exists:
@@ -3012,7 +3308,7 @@ def backup(source, media, *, level="full", base=None, volume_size=None,
                                       cartridge_capacity or volume_size, excludes=excludes, ssh=ssh)
             return write_backup(source, media, level, base, volume_size, buffer_size, quiet,
                                 snapshot_fd, estimated_bytes, remote, frame_size, excludes=excludes,
-                                parent_job=parent, verify=verify)
+                                parent_job=parent, verify=verify, cartridge_capacity=cartridge_capacity)
         finally:
             if remote:
                 remote.close()
@@ -3020,7 +3316,7 @@ def backup(source, media, *, level="full", base=None, volume_size=None,
 
 def write_backup(source, media, level, base, volume_size, buffer_size, quiet,
                  snapshot_fd, estimated_bytes, remote, frame_size, *, excludes=None, zfs=None,
-                 parent_job=None, verify=False):
+                 parent_job=None, verify=False, cartridge_capacity=None):
     job = {"id": uuid.uuid4().hex, "level": level, "parent": base, "source": str(source),
            "created": datetime.now(timezone.utc).isoformat(), "estimated_bytes": estimated_bytes,
            **child_ancestry(parent_job)}
@@ -3037,6 +3333,7 @@ def write_backup(source, media, level, base, volume_size, buffer_size, quiet,
         "no disk archive or state directory")
     with Progress(job["id"], buffer_size=buffer_size, archives=1, passes=2 if verify else 1) as progress, \
             ram_snapshot() as metadata_snapshot:
+        progress.cartridge_capacity = cartridge_capacity
         progress.track_archive(estimated_bytes)
         writer = StreamWriter(media, job, volume_size, progress, buffer_size)
         process = None
@@ -3073,7 +3370,6 @@ def write_backup(source, media, level, base, volume_size, buffer_size, quiet,
                    "snapshot_bytes": snapshot_bytes, "snapshot_sha256": snapshot_hash.hexdigest(),
                    "chunks": writer.sequence}
             writer.send("end", json.dumps(end, sort_keys=True).encode())
-            progress.finish_archive()
             writer.finish()
             progress.phase = 'writing metadata file'
             metadata_complete, append_ready, warnings = False, True, []
@@ -3087,6 +3383,7 @@ def write_backup(source, media, level, base, volume_size, buffer_size, quiet,
                 warnings.append(f'Metadata incomplete: {exc}; append readiness is unknown')
                 log(f'Backup data committed, but the metadata file could not be completed: {exc}. '
                     'Restore/verify remain available; further appends may be refused until the tail is resolved.')
+            progress.finish_archive()
             writer.close()
             media.last_result = {**job, **end, 'volumes': writer.number, 'archive_complete': True,
                                  'metadata_complete': metadata_complete, 'append_ready': append_ready,
@@ -3234,7 +3531,7 @@ def extract_restore_stream(reader, tree, progress, quiet):
         stop_process(process)
 
 
-def restore(backup_ids, destination, media, *, quiet=False, base=None):
+def restore(backup_ids, destination, media, *, quiet=False, base=None, cartridge_capacity=None):
     require_tar()
     if not backup_ids:
         raise BackupError("Specify the full backup ID followed by all incremental IDs")
@@ -3253,6 +3550,8 @@ def restore(backup_ids, destination, media, *, quiet=False, base=None):
     tree = None
     try:
         with restore_lock(destination), media.lock(), Progress("Restore", archives=len(backup_ids)) as progress:
+            progress.cartridge_capacity = cartridge_capacity
+            progress.seed_archives(backup_ids, media)
             parent = read_restore_marker(destination)
             expected_history = parent
             if parent is not None and base and parent['id'] != base:
@@ -3608,7 +3907,8 @@ Check the drive: status, doctor, compression status.
 Manage the tape: compression on|off, wipe (destructive), eject.
 Start full backups on blank tapes; incrementals always append.
 Run tape-backup COMMAND --help for options and tape-selection details.
-Default device: /dev/nst0. Tapes stay loaded until you run eject.''')
+Default device: /dev/nst0. Backups eject full tapes before requesting the next cartridge.
+The final tape stays loaded until you run eject.''')
     parser.add_argument("--version", action="version", version=f"%(prog)s {PROGRAM_VERSION}")
     commands = parser.add_subparsers(dest="command", required=True, title='Commands', metavar='COMMAND', prog=parser.prog)
 
@@ -3654,7 +3954,8 @@ Default device: /dev/nst0. Tapes stay loaded until you run eject.''')
     create.add_argument('--json', action='store_true', help='Print a structured completion summary instead of only the backup ID')
     create.add_argument('--verify', action='store_true', help='Read back and verify all volumes after backup')
     create.add_argument('--dry-run', action='store_true', help='Preview source and size without starting an archive or writing tape')
-    create.add_argument('--cartridge-capacity', type=parse_size, help='Capacity for preview estimates only; requires --dry-run')
+    create.add_argument('--cartridge-capacity', type=parse_size,
+                        help='Usable capacity for tape-count/ETA estimates; does not limit writes (default: detect)')
     create.add_argument('--label-prefix', help='Label new cartridges PREFIX-001, PREFIX-002, etc.; append retains the existing label')
     media_options(create)
     extract = commands.add_parser("restore", help="Stream tapes directly into a restored directory")
@@ -3666,6 +3967,8 @@ Default device: /dev/nst0. Tapes stay loaded until you run eject.''')
     extract.add_argument('--base', help='Last backup already restored here; only needed to adopt an older restore without history')
     extract.add_argument("--destination", type=Path)
     extract.add_argument("--quiet", action="store_true", help="Suppress file names; keep progress and transfer rates")
+    extract.add_argument('--cartridge-capacity', type=parse_size,
+                         help='Usable capacity for tape-count/ETA estimates (default: detect)')
     media_options(extract)
     zcreate = commands.add_parser('zfs-backup', help='Stream an existing ZFS snapshot; --base appends an incremental')
     zcreate.add_argument('--snapshot', required=True, metavar='POOL/DATASET@SNAPSHOT')
@@ -3679,7 +3982,8 @@ Default device: /dev/nst0. Tapes stay loaded until you run eject.''')
     zcreate.add_argument('--json', action='store_true', help='Print a structured completion summary')
     zcreate.add_argument('--verify', action='store_true', help='Read back and verify all volumes after backup')
     zcreate.add_argument('--dry-run', action='store_true', help='Validate snapshot and estimate send size without streaming or writing tape')
-    zcreate.add_argument('--cartridge-capacity', type=parse_size, help='Capacity for preview estimates only; requires --dry-run')
+    zcreate.add_argument('--cartridge-capacity', type=parse_size,
+                         help='Usable capacity for tape-count/ETA estimates; does not limit writes (default: detect)')
     zcreate.add_argument('--label-prefix', help='Label new cartridges PREFIX-001, PREFIX-002, etc.')
     ssh_options(zcreate)
     media_options(zcreate)
@@ -3689,6 +3993,8 @@ Default device: /dev/nst0. Tapes stay loaded until you run eject.''')
     selection.add_argument('--to', help='Discover the full chain ending at this ID from cartridge metadata or --inventory')
     zextract.add_argument('--plan', action='store_true', help='With --to, show the chain without receiving data')
     zextract.add_argument('--dataset', metavar='POOL/DATASET', help='New dataset for a full restore')
+    zextract.add_argument('--cartridge-capacity', type=parse_size,
+                          help='Usable capacity for tape-count/ETA estimates (default: detect)')
     information_options(zextract)
     media_options(zextract)
     inventory = commands.add_parser('inventory', help='Collect cartridge labels and backup headers into an optional JSON inventory')
@@ -3803,8 +4109,6 @@ def main(argv=None):
             if creating and not args.dry_run:
                 media.inventory_output = args.inventory
         if args.command in ('backup', 'zfs-backup'):
-            if args.cartridge_capacity and not args.dry_run:
-                raise BackupError('--cartridge-capacity is for --dry-run estimates; use --volume-size for test rollover')
             if args.label_prefix:
                 valid_label(args.label_prefix)
                 if len(args.label_prefix) > 40:
@@ -3849,9 +4153,10 @@ def main(argv=None):
                                 buffer_size=args.buffer_size, quiet=args.quiet, ssh=ssh, verify=args.verify,
                                 dry_run=args.dry_run, cartridge_capacity=args.cartridge_capacity)
         elif args.command == 'zfs-restore':
-            result = restore_zfs(args.backup, args.dataset, media)
+            result = restore_zfs(args.backup, args.dataset, media, cartridge_capacity=args.cartridge_capacity)
         elif args.command == "restore":
-            result = restore(args.backup, args.destination, media, quiet=args.quiet, base=args.base)
+            result = restore(args.backup, args.destination, media, quiet=args.quiet, base=args.base,
+                             cartridge_capacity=args.cartridge_capacity)
         else:
             if args.backup:
                 valid_id(args.backup)
